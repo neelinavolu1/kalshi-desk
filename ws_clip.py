@@ -2023,6 +2023,7 @@ def pick_watch(k: Kalshi):
     tomorrow = today + timedelta(days=1)
     leftover_mode = False
     ban = load_oneleg_ban()
+    shard0_unfunded = False
     try:
         st = json.loads(STATUS.read_text())
         leftover_mode = (
@@ -2034,8 +2035,18 @@ def pick_watch(k: Kalshi):
             )
         )
         ban |= {str(x) for x in (st.get("oneleg_ban") or []) if x}
+        fc = st.get("free_cash") or st.get("leftover_cash") or st.get("shard_balances") or {}
+        try:
+            cash0 = float(fc.get("0", fc.get(0, 0)) or 0)
+        except (TypeError, ValueError):
+            cash0 = 0.0
+        # Already sitting tennis 2-ways: do not spend watch slots on shard-0
+        # Bears/Titans or WNBA when that shard only has pocket change ($0.50)
+        # and we will not move cash over for a second pair.
+        shard0_unfunded = leftover_mode and cash0 < MIN_LEFTOVER_NOTIONAL
     except Exception:
         leftover_mode = False
+        shard0_unfunded = False
     cands = []
     n_mkt = 0
     for st in SPORT_SERIES:
@@ -2252,12 +2263,21 @@ def pick_watch(k: Kalshi):
         # crowding ATP/MLB off the 20-slot watch (METOWS/LAFGTWN/UVAWPRE).
         series_rank = min(int(x.get("series_rank") or 1) for x in use)
         day = min(int(x.get("day") if x.get("day") is not None else 9) for x in use)
+        # Skip unpinned pairs we will not sit anyway. Used to require
+        # in_play, so pregame (or first-ball clock still in the future)
+        # CHI/TEN 15/83 and TOR/PHX 78c still filled leftover GAME slots
+        # and rotated GULMOL 96c tennis off the 20-name watch.
         skip_unpinned = bool(
-            in_play
-            and pair
+            pair
             and ya is not None
             and yb is not None
-            and is_lopsided_pair(ya, yb)
+            and (
+                is_lopsided_pair(ya, yb)
+                or ya < LIVE_BID_LO - 1e-12
+                or ya > LIVE_BID_HI + 1e-12
+                or yb < LIVE_BID_LO - 1e-12
+                or yb > LIVE_BID_HI + 1e-12
+            )
         )
         scored.append(
             {
@@ -2294,6 +2314,9 @@ def pick_watch(k: Kalshi):
                 continue
             if (not keep_lopsided) and row.get("skip_unpinned"):
                 continue
+            if (not keep_lopsided) and shard0_unfunded:
+                if any(int(leg.get("exchange_index") or 0) == 0 for leg in row["legs"]):
+                    continue
             pending = [leg for leg in row["legs"] if leg["ticker"] not in have]
             if not pending:
                 continue
