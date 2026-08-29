@@ -18,13 +18,15 @@ full cent better all-in. If leftover rest_allin exceeds 0.99 (book walked off),
 cancel those oids (never HARLLA) and rest a pair that still pays. Size leftover
 by depth + free shard cash; never fund a second pair via transfer.
 On a one-leg fill (exactly one inventory leg; matching 2-way locks skip),
-KEEP the original paired yes-bid rest if it is still working, fill+rest
-<=0.99, rest not stale (live_bid-rest_px > 2c), and both prices in 0.35-0.65.
+KEEP the original paired yes-bid rest if it is still working and fill+rest
+<=0.99 (ignore 2c stale and 35-65 — GTC can still print after the book moves).
 Do not cancel, flatten, or oneleg_ban that game — lock completes only via
 that original rest printing. Never place a new buy on the missing wing.
-Else true orphan (no rest / stale / fill+rest>0.99 / wing): cancel leftover
-rest, oneleg_ban, flatten the filled YES at ~1c under cost:
-target=round(cost-0.01, 2) in (0, 1).
+If fill+rest >0.99 while that rest is still working: keep waiting (do not
+buy more, do not sell). Cancel that other buy only if fill+rest >1.00
+(losing lock if it printed); if 0.99<sum<=1.00 wait for fees. True orphan
+(no other buy on the event): wait 180s, then flatten the filled YES at
+~1c under cost: target=round(cost-0.01, 2) in (0, 1).
 FIRST flatten action is always post_only SELL (no reduce_only; Kalshi IOC-only): px=target if
 live_bid is None or < target, else px=round(min(0.99, live_bid+0.01), 2)
 (maker above bid; never post_only <= live_bid / no taker fee). If a flatten
@@ -108,6 +110,7 @@ ONELEG_STALE_C = 0.02  # keep unfilled rest only if live_bid - rest_px <= 2c
 ONELEG_MAKER_WAIT_S = 45.0  # wait for 1c-under-cost maker flatten before give-up IOC
 ONELEG_GIVEUP_UNDER = 0.02  # give-up IOC only if live_bid still < target - this
 ONELEG_NEAR_C = 0.01  # existing flatten ask counts as at/near target
+ONELEG_ORPHAN_WAIT_S = 180.0  # true orphan: wait before maker-sell leftover
 # Already LIVE on book — do not duplicate, do not cancel.
 KNOWN_LIVE = (
     ("KXATPMATCH-26AUG27HARLLA-HAR", "01a044d3-b7e8-7c4c-a7fc-a328d4559e62"),
@@ -1003,7 +1006,7 @@ def _oneleg_log(state: dict, rec: dict) -> None:
 
 
 def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
-    """One-leg 2-way fill. Equal-size locks skip (hold). Keep original paired yes-bid rest if still working, fill+rest<=0.99, not stale, both px in 0.35-0.65; else cancel rest, oneleg_ban, maker-first flatten. Never buy the missing wing. Never 101c."""
+    """One-leg 2-way fill. Equal-size locks skip (hold). Keep original paired yes-bid rest if still working and fill+rest<=0.99 (ignore stale/35-65). If fill+rest>0.99 keep/wait; cancel rest only if fill+rest>1.00. True orphan (no other buy): wait 180s then maker-first flatten. Never buy the missing wing. Never 101c."""
     positions = state.get("open_positions") or []
     orders = state.get("resting") or []
     by_ev: dict[str, list] = {}
@@ -1035,6 +1038,7 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
             except (TypeError, ValueError):
                 pass
         if len(plist) == 2 and len(sizes) == 2 and abs(sizes[0] - sizes[1]) <= 1e-6:
+            (state.get("oneleg_seen_ts") or {}).pop(ev, None)
             continue
         # Flatten-price path only when exactly one leg has inventory.
         if len(plist) != 1:
@@ -1123,15 +1127,15 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
         except (TypeError, ValueError):
             in_band = False
         rec["lopsided"] = bool(rest_legs) and not in_band
-        # Original paired rest still working: keep it if lock_if_prints still pays.
+        seen_map = state.setdefault("oneleg_seen_ts", {})
+        # Original paired rest still working: keep if fill+rest still pays.
+        # Ignore 2c stale and 35-65: a GTC buy can still get hit after 2c.
         keep_rest = (
             bool(rest_legs)
-            and lock_if_prints is not None
-            and lock_if_prints <= 0.99 + 1e-12
-            and not rec["stale"]
-            and in_band
+            and (lock_if_prints is None or lock_if_prints <= 0.99 + 1e-12)
         )
         if keep_rest:
+            seen_map.pop(ev, None)
             rec["action"] = "ONELEG keep paired rest"
             recs.append(rec)
             leftover_note(
@@ -1144,6 +1148,64 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
                     f"{fqty}@{rec.get('filled_px')} rest={rest_t} "
                     f"{rest_q}@{rec.get('rest_px')} "
                     f"lock_if_prints={rec['lock_if_prints']}"
+                ),
+            )
+            _oneleg_log(state, rec)
+            continue
+        # Rest still working, fill+rest > 0.99: keep original rest, do not sell.
+        # Cancel only a would-be losing lock (>1.00). 0.99<sum<=1.00 wait (fees).
+        if rest_legs and lock_if_prints is not None and lock_if_prints <= 1.00 + 1e-12:
+            seen_map.pop(ev, None)
+            rec["action"] = "ONELEG wait paired rest"
+            recs.append(rec)
+            leftover_note(
+                state,
+                None,
+                0,
+                0,
+                (
+                    f"ONELEG wait paired rest {ev} filled={ft} "
+                    f"{fqty}@{rec.get('filled_px')} rest={rest_t} "
+                    f"{rest_q}@{rec.get('rest_px')} "
+                    f"lock_if_prints={rec['lock_if_prints']} (fees)"
+                ),
+            )
+            _oneleg_log(state, rec)
+            continue
+        if rest_legs:
+            # fill+rest > 1.00: other buy would lose if it printed. Cancel it,
+            # then orphan-wait (do not sell this cycle).
+            cache = state.setdefault("idx_cache", {})
+            for o in rest_legs:
+                t = order_ticker(o)
+                idx = cache.get(t)
+                if idx is None:
+                    idx = guess_exchange_index(t)
+                cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t)
+                log(
+                    f"ONELEG cancel rest {t} px={order_price_dollars(o):.2f} "
+                    f"live={live_rest} losing_lock={rec.get('lock_if_prints')}"
+                )
+            rest_legs = []
+        # TRUE ORPHAN = no other buy order on this event. Do not sell immediately.
+        seen = float(seen_map.get(ev) or 0.0)
+        if seen > now + 1.0:
+            seen = 0.0
+        if seen <= 0:
+            seen_map[ev] = now
+            seen = now
+        orphan_wait = now - seen
+        if orphan_wait < ONELEG_ORPHAN_WAIT_S:
+            rec["action"] = "ONELEG wait other side 180s"
+            recs.append(rec)
+            leftover_note(
+                state,
+                None,
+                0,
+                0,
+                (
+                    f"ONELEG wait other side 180s {ev} filled={ft} "
+                    f"{fqty}@{rec.get('filled_px')} waited={orphan_wait:.0f}s"
                 ),
             )
             _oneleg_log(state, rec)
@@ -2778,6 +2840,7 @@ async def main_async():
         "oneleg": None,
         "naked_flatten": None,
         "oneleg_action_ts": 0.0,
+        "oneleg_seen_ts": {},
         "oneleg_log_ts": {},
         "oneleg_ban": list(load_oneleg_ban()),
     }
@@ -2825,6 +2888,7 @@ async def main_async():
                 "oneleg": persist.get("oneleg"),
                 "naked_flatten": persist.get("naked_flatten"),
                 "oneleg_action_ts": float(persist.get("oneleg_action_ts") or 0.0),
+                "oneleg_seen_ts": persist.setdefault("oneleg_seen_ts", {}),
                 "oneleg_log_ts": persist.setdefault("oneleg_log_ts", {}),
                 "oneleg_ban": set(persist.get("oneleg_ban") or []),
                 "port_ts": 0.0,
@@ -2853,6 +2917,7 @@ async def main_async():
                 persist["oneleg"] = state.get("oneleg")
                 persist["naked_flatten"] = state.get("naked_flatten")
                 persist["oneleg_action_ts"] = float(state.get("oneleg_action_ts") or 0.0)
+                persist["oneleg_seen_ts"] = dict(state.get("oneleg_seen_ts") or {})
                 persist["oneleg_ban"] = list(state.get("oneleg_ban") or [])
                 save_oneleg_ban(persist["oneleg_ban"])
         except SeqGap as e:
