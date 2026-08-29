@@ -37,6 +37,18 @@ the maker ask. Never flatten a locked pair. Never 101c. Drop banned and unpinned
 the watch so they cannot crowd restable 97c books.
 Never print keys or PEM.
 """
+
+# Strategy in plain English (for someone new to these markets):
+# Each sports game is two YES contracts -- one per team. Exactly one team
+# wins, so that YES pays $1 and the other pays $0.
+# We sit a buy order on both teams at once, cheap enough that the two
+# prices add to 99 cents or less. If both orders go through we own the $10 card:
+# one side will be worth $1 per contract no matter who wins. Hold that pair.
+# If only one order went through: keep the other buy if it is still sitting
+# and the two prices still add to $1.00 or less (ignore a 2-cent market move).
+# If the other buy is gone, wait 3 minutes after the first side went through
+# before selling the leftover contract. Never sit a new buy on the missing
+# team. Never pay $1.01 or more to complete the pair.
 from __future__ import annotations
 
 import asyncio
@@ -91,6 +103,9 @@ FUND_DOLLARS = 12.0
 PAIR_CASH_UNIT = 9.5  # concurrent rests = min(MAX_LIVE_PAIRS, floor(shard_cash / this))
 MAX_LIVE_PAIRS = 2  # leftover cash may rest a second pair without filled inventory
 MAX_STACKED_PAIRS = 2  # alias: max concurrent post-only 2-way rests
+# Only try a game when each team's YES buy price is between 35 cents and 65 cents.
+# Outside that band one team is a heavy favorite, and we often end up
+# owning only one side instead of both.
 LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
 LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
 LIVE_REST_MAX = 0.99  # raw yes+yes cap
@@ -585,6 +600,10 @@ def is_lopsided_pair(ya, yb) -> bool:
     return abs(a - b) > LEFTOVER_INPLAY_BID_GAP + 1e-12
 
 
+# Should we sit buy orders on both teams of this game?
+# Returns None if the prices look fair enough to try. Otherwise a short
+# reason to skip: a team outside 35-65 cents, one team a huge favorite, the two
+# prices adding up over 99 cents, or the bid/ask gap too wide.
 def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = True) -> str | None:
     """None => book filters pass for a live post_only 2-way rest.
 
@@ -811,6 +830,9 @@ def open_pos_is_locked(positions) -> bool:
     return True
 
 
+# Place a buy order for YES on one team and leave it sitting on the book.
+# post_only=True means we only sit; we never take someone else's offer
+# (that would cost extra).
 def place_yes_post_only(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
     # NEVER lift: post_only must stay true. V2 events/orders only (V1 is 410).
     body = {
@@ -828,6 +850,9 @@ def place_yes_post_only(k: Kalshi, ticker: str, price: float, count: int, exchan
     return k.post("/portfolio/events/orders", body)
 
 
+# Place a sell order for a leftover YES contract we already own, and leave
+# it sitting on the book. Used after the 3-minute wait when the other
+# team's buy is gone. Never sell at $1.00 or more.
 def place_yes_post_only_sell(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
     """Maker flatten: sell YES. post_only stays true. No reduce_only (Kalshi: IOC only). Never >= $1.00 / 101c."""
     if float(price) >= 1.0 - 1e-12 or float(price) <= 0:
@@ -847,6 +872,9 @@ def place_yes_post_only_sell(k: Kalshi, ticker: str, price: float, count: int, e
     return k.post("/portfolio/events/orders", body)
 
 
+# Sell a leftover YES contract immediately at the current best bid, instead
+# of waiting on the book. Last resort after a sitting sell has waited ~45s
+# and the bid has dropped. Never sell at $1.00 or more.
 def place_yes_ioc_sell(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
     """IOC flatten: sell YES at the live bid. post_only=False. Never >= $1.00 / 101c."""
     if float(price) >= 1.0 - 1e-12 or float(price) <= 0:
@@ -1005,8 +1033,13 @@ def _oneleg_log(state: dict, rec: dict) -> None:
     )
 
 
+# One team's buy went through; we own YES on only one side of a game.
+# Matching size on both teams already: hold (the $10 card) -- skip this.
+# Other buy still sitting and prices add to $1.00 or less: keep that buy
+# (ignore a 2-cent market move). Never a new buy on the missing team.
+# Other buy gone: wait 3 minutes after the first order went through, then
+# sell the leftover contract. Never pay $1.01+ to complete the pair.
 def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
-    """One-leg 2-way fill. Equal-size locks skip (hold). Keep original paired yes-bid rest if still working and fill+rest<=0.99 (ignore stale/35-65). If fill+rest>0.99 keep/wait; cancel rest only if fill+rest>1.00. True orphan (no other buy): wait 180s then maker-first flatten. Never buy the missing wing. Never 101c."""
     positions = state.get("open_positions") or []
     orders = state.get("resting") or []
     by_ev: dict[str, list] = {}
@@ -1128,8 +1161,9 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
             in_band = False
         rec["lopsided"] = bool(rest_legs) and not in_band
         seen_map = state.setdefault("oneleg_seen_ts", {})
-        # Original paired rest still working: keep if fill+rest still pays.
-        # Ignore 2c stale and 35-65: a GTC buy can still get hit after 2c.
+        # Other team's buy is still sitting, and the two prices add to 99 cents
+        # or less: keep it. Ignore a 2-cent market move -- that sitting buy can
+        # still go through. Never a new buy on the missing team.
         keep_rest = (
             bool(rest_legs)
             and (lock_if_prints is None or lock_if_prints <= 0.99 + 1e-12)
@@ -1152,8 +1186,9 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
             )
             _oneleg_log(state, rec)
             continue
-        # Rest still working, fill+rest > 0.99: keep original rest, do not sell.
-        # Cancel only a would-be losing lock (>1.00). 0.99<sum<=1.00 wait (fees).
+        # Other buy still sitting and prices add to $1.00 or less: keep it
+        # (fees can eat the last penny). Do not sell the leftover. Do not
+        # sit a new buy on the missing team.
         if rest_legs and lock_if_prints is not None and lock_if_prints <= 1.00 + 1e-12:
             seen_map.pop(ev, None)
             rec["action"] = "ONELEG wait paired rest"
@@ -1173,8 +1208,10 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
             _oneleg_log(state, rec)
             continue
         if rest_legs:
-            # fill+rest > 1.00: other buy would lose if it printed. Cancel it,
-            # then orphan-wait (do not sell this cycle).
+            # Prices would add to more than $1.00 if the other buy went
+            # through -- we would lose. Cancel that sitting buy, then wait
+            # 3 minutes (do not sell the leftover this pass). Never a new
+            # buy on the missing team.
             cache = state.setdefault("idx_cache", {})
             for o in rest_legs:
                 t = order_ticker(o)
@@ -1187,7 +1224,9 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
                     f"live={live_rest} losing_lock={rec.get('lock_if_prints')}"
                 )
             rest_legs = []
-        # TRUE ORPHAN = no other buy order on this event. Do not sell immediately.
+        # Other team's buy is gone. Wait 3 minutes after the first order
+        # went through before selling the leftover contract. Never a new
+        # buy on the missing team. Never pay $1.01+ to complete.
         seen = float(seen_map.get(ev) or 0.0)
         if seen > now + 1.0:
             seen = 0.0
@@ -1214,8 +1253,9 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
         cache = state.setdefault("idx_cache", {})
         state.setdefault("oneleg_ban", set()).add(ev)
         save_oneleg_ban(state["oneleg_ban"])
-        # True orphan: cancel leftover rest + extra bids on the filled ticker.
-        # Never lift / buy the missing wing. Never 101c.
+        # 3 minutes are up and the other buy is gone: sell the leftover
+        # contract we already own. Never a new buy on the missing team.
+        # Never pay $1.01+ to complete.
         for o in rest_legs:
             t = order_ticker(o)
             idx = cache.get(t)
@@ -1683,6 +1723,9 @@ def leftover_note(state: dict, cash, qty, notional, reason: str | None = None) -
         state["leftover_sit_reason"] = reason
 
 
+# Try to sit buy orders on both teams of this game (wait on both sides).
+# If we already own a leftover contract on one team of this same game,
+# handle that instead -- never sit a new buy on the missing team.
 def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str:
     if event_prefix(tw["a"]) in (state.get("oneleg_ban") or set()):
         return "oneleg ban — already flattened, do not re-buy"
