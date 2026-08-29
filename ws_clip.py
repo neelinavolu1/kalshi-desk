@@ -10,9 +10,12 @@ Fund first: GET /portfolio/balance?exchange_index=N, then
 POST /portfolio/intra_exchange_instance_transfer (~$12 centicents, leftover stays
 on shard 0). V1 POST /portfolio/orders is 410; V2 /portfolio/events/orders only.
 Never lift (post_only=true). Never duplicate HARLLA. Do not cancel HARLLA.
-Concurrent post-only 2-way rests = min(2, floor(shard_cash / 9.5)). Do NOT wait
-for a filled inventory 2-way before the second rest. Second pair is allowed when
-leftover after existing rests still funds min(10, depth)*(yes_a+yes_b). Prefer
+Concurrent post-only 2-way rests = min(2, floor(shard_cash / 9.5)), but after a
+filled lock the leftover free cash on that shard may still sit a smaller second
+pair when free >= MIN_LEFTOVER_NOTIONAL (size by depth + free; do not require
+another $9.50). Do NOT wait for a filled inventory 2-way before the second rest.
+Do not spend the one live-attempt tick on a shard whose free cash is below that
+min (Sep NFL on shard 0 with $0.50) while tennis cash sits idle. Prefer
 independent events. Do not cancel a still-paying rest unless a candidate is a
 full cent better all-in. If leftover rest_allin exceeds 0.99 (book walked off),
 cancel those oids (never HARLLA) and rest a pair that still pays. Size leftover
@@ -1813,6 +1816,17 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     # Only force a first-pair slot when we have neither resting nor filled locks.
     if n_rest_pairs == 0 and n_inv_pairs == 0:
         n_allowed = max(n_allowed, 1)
+    # After a filled 2-way, total cash can fall so floor(cash/9.5) equals the
+    # remaining sitting pair (SDTB lock left $14.53 → cap 1, Svrcina/Royer
+    # already sitting). ~$4.93 leftover could still buy a smaller second
+    # pair on THIS shard. Count that extra slot when free cash is at least
+    # the leftover minimum; live_qty will shrink the size.
+    if (
+        leftover
+        and n_rest_pairs < MAX_LIVE_PAIRS
+        and free + 1e-12 >= MIN_LEFTOVER_NOTIONAL
+    ):
+        n_allowed = max(n_allowed, n_rest_pairs + 1)
     state["pair_cap"] = n_allowed
     state["n_live_pairs"] = n_rest_pairs
 
@@ -2720,6 +2734,36 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                         log(f"LIVE {tag} {evn} {why} rest_allin={tw.get('rest_allin')}")
                     continue
                 evn = event_prefix(tw["a"])
+                # Leftover only: skip a 2-way whose shard has too little free
+                # cash (Bears/Vikings on shard 0 with $0.50) so this tick can
+                # try Gold/Parry on the tennis shard that still has leftover.
+                if leftover_now:
+                    cache = state.get("idx_cache") or {}
+                    try:
+                        dest = int(cache.get(tw["a"], guess_exchange_index(tw["a"])))
+                    except (TypeError, ValueError):
+                        dest = guess_exchange_index(tw["a"])
+                    free_d = (state.get("free_cash") or {}).get(str(dest))
+                    if free_d is None:
+                        free_d = (state.get("shard_balances") or {}).get(str(dest))
+                    try:
+                        if free_d is not None and float(free_d) + 1e-12 < MIN_LEFTOVER_NOTIONAL:
+                            if sit_why is None:
+                                sit_why = (
+                                    f"{evn}: dest shard free={float(free_d):.2f} "
+                                    "below leftover min"
+                                )
+                            key = f"{evn}|dest-free"
+                            now = time.monotonic()
+                            if now - skip_log.get(key, 0) > 60:
+                                skip_log[key] = now
+                                log(
+                                    f"LIVE leftover sit {evn} dest shard "
+                                    f"free={float(free_d):.2f} below leftover min"
+                                )
+                            continue
+                    except (TypeError, ValueError):
+                        pass
                 last = state.setdefault("live_attempt_ts", {})
                 if time.monotonic() - last.get(evn, 0) < 40:
                     continue
