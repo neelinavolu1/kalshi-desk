@@ -115,7 +115,10 @@ LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93
 LIVE_TAKE_REST_GAP_MAX = 0.04
 MIN_LEFTOVER_NOTIONAL = 4.0  # sit leftover if sized clip notional below this
 # Cancel a still-passing leftover rest if a new candidate is this much better (all-in $).
-LEFTOVER_UPGRADE_ALLIN = 0.015  # 1.0c ties flapped AZSFG1→AZSFG2 then cancelled wide
+# Cross-matchup: 1.0c (VIDBOU 97c was stuck behind SVRROY/CWSMIN 98c for 10+ min).
+# Same doubleheader stem (G1/G2): keep 1.5c so AZSFG1↔G2 does not thrash.
+LEFTOVER_UPGRADE_ALLIN = 0.010
+LEFTOVER_UPGRADE_SAME_STEM = 0.015
 # Lopsided gap for ALL live 2-way rests (not only leftover in-play).
 # 25/70 and 70/25 must not stack pregame either. LIVE_BID 35-65 is the wing gate.
 LEFTOVER_INPLAY_BID_LO = 0.25
@@ -1559,8 +1562,8 @@ def release_stale_leftover_rest(
     missing snap quotes left the slot stuck. Never touch HARLLA.
 
     Also upgrade: if candidate_tw clears leftover filters and beats the resting
-    leftover by >= LEFTOVER_UPGRADE_ALLIN, cancel the weaker rest so the better
-    one can take the stacked slot.
+    leftover by >= LEFTOVER_UPGRADE_ALLIN (or SAME_STEM), cancel the weaker
+    rest so the better one can take the stacked slot.
     """
     now = time.monotonic()
     tw_by_ev = {}
@@ -1677,7 +1680,13 @@ def release_stale_leftover_rest(
                     ra = float(tw.get("rest_allin"))
                 except (TypeError, ValueError):
                     ra = None
-                if ra is not None and cand_ra + LEFTOVER_UPGRADE_ALLIN <= ra + 1e-12:
+                # Same stem (doubleheader) needs a wider gap; other matchups 1.0c.
+                need = (
+                    LEFTOVER_UPGRADE_SAME_STEM
+                    if game_stem(cand_ev or "") == game_stem(ev)
+                    else LEFTOVER_UPGRADE_ALLIN
+                )
+                if ra is not None and cand_ra + need <= ra + 1e-12:
                     upgrade_picks.append(
                         (
                             ra,
@@ -1685,7 +1694,7 @@ def release_stale_leftover_rest(
                             {
                                 "why": (
                                     f"upgrade to {cand_ev} rest_allin={cand_ra:.3f} "
-                                    f"beats {ra:.3f}"
+                                    f"beats {ra:.3f} need={need:.3f}"
                                 ),
                                 "tw": tw,
                             },
