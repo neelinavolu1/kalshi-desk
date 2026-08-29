@@ -1625,28 +1625,35 @@ def release_stale_leftover_rest(
         tw = tw_by_ev.get(ev)
         why = None
         miss = state.setdefault("leftover_missing_since", {})
+        our = resting_pair_quote(orders, ev)
         if not tw:
-            # Watch/universe rebuild blanks two_ways_snap for a couple seconds.
-            # Cancel-on-first-miss flapped leftover SDTB <-> BOSNYYG1 ~every 3m.
-            # Only free the slot if the snap stays gone; filter-fail still cancels now.
-            started = miss.get(ev)
-            if started is None:
-                miss[ev] = now
-                continue
-            if now - float(started) < 30.0:
-                continue
-            why = "missing snap (cannot verify leftover)"
+            # Watch rebuild blanks the live book for a couple seconds.
+            # If our two buy orders are still sitting, check those prices
+            # now. Waiting 30s left Svrcina/Royer at 99.8c all-in blocking
+            # a 97c second game, and the upgrade dumped the other (better)
+            # Sox/Twins buy instead. Only wait when we also have no orders.
+            if our is not None:
+                miss.pop(ev, None)
+                tw = our
+                why = live_filter_reason(our, leftover=True, placement=True)
+            else:
+                started = miss.get(ev)
+                if started is None:
+                    miss[ev] = now
+                    continue
+                if now - float(started) < 30.0:
+                    continue
+                why = "missing snap (cannot verify leftover)"
         else:
             miss.pop(ev, None)
             why = live_filter_reason(tw, leftover=True, placement=False)
-            # Prefer OUR resting prices over the touch. Touch flicking to 99c
-            # must not cancel a still-valid 96-97c post_only pair.
-            # OUR posted wings MUST stay in LIVE_BID 35-65 (and not lopsided):
-            # placement rejects new 32/65, but keep-working used to leave
+            # Prefer OUR buy prices over the live tape. Tape flicking to 99c
+            # must not cancel a still-valid 96-97c pair of buy orders.
+            # OUR buy prices MUST stay in 35-65 (and not lopsided):
+            # new buys reject 32/65, but keep-working used to leave
             # POTVAL 32+65 / VANNOR 33+65 sitting for hours and cap better
-            # in-band books (VIDBOU 47/50, OLIBRA 48/49). Touch flick alone
-            # still does not cancel; only our resting quote does.
-            our = resting_pair_quote(orders, ev)
+            # in-band books (VIDBOU 47/50, OLIBRA 48/49). Tape flick alone
+            # still does not cancel; only our sitting buy prices do.
             if our is not None and tw is not None:
                 our["in_play"] = tw.get("in_play")
             if our is not None:
@@ -2328,6 +2335,33 @@ def pick_watch(k: Kalshi):
     # Keep working live orders on the watch. HARLLA was rotated off at 15:59 ET
     # while 10-lot post-only rests were still on the book.
     pin_ts = live_pin_tickers()
+    # Take-lock *peaks* stay in status after the cheap take is gone.
+    # Today's Sox/Twins 99.6c peak became 77/22 at 101c take and still
+    # pinned 2 watch slots (keep_lopsided) in front of 97c tennis.
+    # Only pin a take-lock flash if we still have buys sitting on it,
+    # we already own it, or the live pair is not a lopsided in-play.
+    rest_inv_pref = set()
+    try:
+        st_pin = json.loads(STATUS.read_text())
+        rest_inv_pref = {
+            event_prefix(t)
+            for t in list(st_pin.get("resting_tickers") or [])
+            + list(st_pin.get("open_pos_tickers") or [])
+            if t
+        }
+    except Exception:
+        rest_inv_pref = set()
+    dead_lock_ev = {
+        row.get("ev")
+        for row in scored
+        if row.get("skip_unpinned")
+    }
+    pin_ts = [
+        t
+        for t in pin_ts
+        if event_prefix(t) in rest_inv_pref
+        or event_prefix(t) not in dead_lock_ev
+    ]
     pin_pref = {event_prefix(t) for t in pin_ts}
     by_ticker = {c["ticker"]: c for c in cands}
     pinned_rows = [
