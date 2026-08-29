@@ -18,9 +18,13 @@ full cent better all-in. If leftover rest_allin exceeds 0.99 (book walked off),
 cancel those oids (never HARLLA) and rest a pair that still pays. Size leftover
 by depth + free shard cash; never fund a second pair via transfer.
 On a one-leg fill (exactly one inventory leg; matching 2-way locks skip),
-cancel the unfilled rest and extra bids on the filled ticker and ban the
-event (oneleg_ban.json). Never rest/lift/buy the missing wing. Flatten
-the filled YES at ~1c under cost: target=round(cost-0.01, 2) in (0, 1).
+KEEP the original paired yes-bid rest if it is still working, fill+rest
+<=0.99, rest not stale (live_bid-rest_px > 2c), and both prices in 0.35-0.65.
+Do not cancel, flatten, or oneleg_ban that game — lock completes only via
+that original rest printing. Never place a new buy on the missing wing.
+Else true orphan (no rest / stale / fill+rest>0.99 / wing): cancel leftover
+rest, oneleg_ban, flatten the filled YES at ~1c under cost:
+target=round(cost-0.01, 2) in (0, 1).
 FIRST flatten action is always post_only SELL (no reduce_only; Kalshi IOC-only): px=target if
 live_bid is None or < target, else px=round(min(0.99, live_bid+0.01), 2)
 (maker above bid; never post_only <= live_bid / no taker fee). If a flatten
@@ -999,7 +1003,7 @@ def _oneleg_log(state: dict, rec: dict) -> None:
 
 
 def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
-    """One-leg fill of a 2-way: never a completed lock. Maker SELL first (target or 1c above bid); IOC only after 45s if bid walked."""
+    """One-leg 2-way fill. Equal-size locks skip (hold). Keep original paired yes-bid rest if still working, fill+rest<=0.99, not stale, both px in 0.35-0.65; else cancel rest, oneleg_ban, maker-first flatten. Never buy the missing wing. Never 101c."""
     positions = state.get("open_positions") or []
     orders = state.get("resting") or []
     by_ev: dict[str, list] = {}
@@ -1098,12 +1102,58 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
             leftover_note(state, None, 0, 0, f"ONELEG {ev} flatten lock {locks[0]}")
             _oneleg_log(state, rec)
             continue
+        rec["stale"] = rest_is_stale(rest_px, live_rest)
+        lock_if_prints = None
+        if fill_px is not None and rest_px is not None:
+            try:
+                lock_if_prints = float(fill_px) + float(rest_px)
+            except (TypeError, ValueError):
+                lock_if_prints = None
+        rec["lock_if_prints"] = (
+            None if lock_if_prints is None else round(float(lock_if_prints), 4)
+        )
+        in_band = False
+        try:
+            in_band = (
+                fill_px is not None
+                and rest_px is not None
+                and LIVE_BID_LO - 1e-12 <= float(fill_px) <= LIVE_BID_HI + 1e-12
+                and LIVE_BID_LO - 1e-12 <= float(rest_px) <= LIVE_BID_HI + 1e-12
+            )
+        except (TypeError, ValueError):
+            in_band = False
+        rec["lopsided"] = bool(rest_legs) and not in_band
+        # Original paired rest still working: keep it if lock_if_prints still pays.
+        keep_rest = (
+            bool(rest_legs)
+            and lock_if_prints is not None
+            and lock_if_prints <= 0.99 + 1e-12
+            and not rec["stale"]
+            and in_band
+        )
+        if keep_rest:
+            rec["action"] = "ONELEG keep paired rest"
+            recs.append(rec)
+            leftover_note(
+                state,
+                None,
+                0,
+                0,
+                (
+                    f"ONELEG keep paired rest {ev} filled={ft} "
+                    f"{fqty}@{rec.get('filled_px')} rest={rest_t} "
+                    f"{rest_q}@{rec.get('rest_px')} "
+                    f"lock_if_prints={rec['lock_if_prints']}"
+                ),
+            )
+            _oneleg_log(state, rec)
+            continue
         rec["action"] = "NAKED_FLATTEN"
         cache = state.setdefault("idx_cache", {})
         state.setdefault("oneleg_ban", set()).add(ev)
         save_oneleg_ban(state["oneleg_ban"])
-        # Cancel ALL missing-wing rests and extra bids on the filled ticker.
-        # Never keep the rest. Never lift the missing wing. Never 101c.
+        # True orphan: cancel leftover rest + extra bids on the filled ticker.
+        # Never lift / buy the missing wing. Never 101c.
         for o in rest_legs:
             t = order_ticker(o)
             idx = cache.get(t)
@@ -1595,7 +1645,7 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     pos_events = open_position_events(positions)
     locked = open_pos_is_locked(positions)
     if pos_events and not locked:
-        # One-leg fill is not a completed lock. Always flatten; never keep/lift.
+        # One-leg fill is not a completed lock. Keep original paired rest if still paying; else flatten. Never rest a NEW pair / buy missing wing.
         try:
             handle_oneleg_inventory(k, state, None)
         except Exception as e:
