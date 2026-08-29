@@ -17,6 +17,18 @@ independent events. Do not cancel a still-paying rest unless a candidate is a
 full cent better all-in. If leftover rest_allin exceeds 0.99 (book walked off),
 cancel those oids (never HARLLA) and rest a pair that still pays. Size leftover
 by depth + free shard cash; never fund a second pair via transfer.
+On a one-leg fill (exactly one inventory leg; matching 2-way locks skip),
+cancel the unfilled rest and extra bids on the filled ticker and ban the
+event (oneleg_ban.json). Never rest/lift/buy the missing wing. Flatten
+the filled YES at ~1c under cost: target=round(cost-0.01, 2) in (0, 1).
+FIRST flatten action is always post_only SELL (no reduce_only; Kalshi IOC-only): px=target if
+live_bid is None or < target, else px=round(min(0.99, live_bid+0.01), 2)
+(maker above bid; never post_only <= live_bid / no taker fee). If a flatten
+ask already rests within 1c of that px, do not duplicate. IOC-sell at
+live_bid ONLY as give-up: maker rest still open after ~45s AND live_bid
+< target-0.02 (bid walked). If bid is still near cost after 45s, leave
+the maker ask. Never flatten a locked pair. Never 101c. Drop banned and unpinned in-play lopsided games off
+the watch so they cannot crowd restable 97c books.
 Never print keys or PEM.
 """
 from __future__ import annotations
@@ -63,6 +75,7 @@ STATUS = DIR / "mm_status.json"
 LOG = DIR / "mm.log"
 PIDFILE = DIR / "mm.pid"
 HEARTBEAT = DIR / "mm_heartbeat"
+BAN_PATH = DIR / "oneleg_ban.json"
 
 LIVE_FIRE = True  # post_only 2-way YES rests only; never lift
 CAP_C = 10
@@ -72,14 +85,25 @@ FUND_DOLLARS = 12.0
 PAIR_CASH_UNIT = 9.5  # concurrent rests = min(MAX_LIVE_PAIRS, floor(shard_cash / this))
 MAX_LIVE_PAIRS = 2  # leftover cash may rest a second pair without filled inventory
 MAX_STACKED_PAIRS = 2  # alias: max concurrent post-only 2-way rests
-LIVE_BID_LO = 0.18  # was 0.20; 0.19 wings with +edge were dropped
-LIVE_BID_HI = 0.80
+LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
+LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
 LIVE_REST_MAX = 0.99  # raw yes+yes cap
 LIVE_REST_ALLIN_MAX = 0.99  # leftover second pair: >=~1c after M=0.5
 LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93c
+# Raw take-rest gap. BROLOF 08:07 ET: 95c rest / 101c take (+3.2c all-in) one-legged in 20s.
+LIVE_TAKE_REST_GAP_MAX = 0.04
 MIN_LEFTOVER_NOTIONAL = 4.0  # sit leftover if sized clip notional below this
 # Cancel a still-passing leftover rest if a new candidate is this much better (all-in $).
 LEFTOVER_UPGRADE_ALLIN = 0.015  # 1.0c ties flapped AZSFG1→AZSFG2 then cancelled wide
+# Lopsided gap for ALL live 2-way rests (not only leftover in-play).
+# 25/70 and 70/25 must not stack pregame either. LIVE_BID 35-65 is the wing gate.
+LEFTOVER_INPLAY_BID_LO = 0.25
+LEFTOVER_INPLAY_BID_HI = 0.75
+LEFTOVER_INPLAY_BID_GAP = 0.35  # keep; applied to every 2-way live rest
+ONELEG_STALE_C = 0.02  # keep unfilled rest only if live_bid - rest_px <= 2c
+ONELEG_MAKER_WAIT_S = 45.0  # wait for 1c-under-cost maker flatten before give-up IOC
+ONELEG_GIVEUP_UNDER = 0.02  # give-up IOC only if live_bid still < target - this
+ONELEG_NEAR_C = 0.01  # existing flatten ask counts as at/near target
 # Already LIVE on book — do not duplicate, do not cancel.
 KNOWN_LIVE = (
     ("KXATPMATCH-26AUG27HARLLA-HAR", "01a044d3-b7e8-7c4c-a7fc-a328d4559e62"),
@@ -341,6 +365,22 @@ def event_prefix(ticker: str) -> str:
         return ticker
     return ticker.rsplit("-", 1)[0]
 
+
+def load_oneleg_ban() -> set[str]:
+    """Disk ban survives supervise restarts. Flatten scripts must hit this file too."""
+    try:
+        raw = json.loads(BAN_PATH.read_text())
+        if isinstance(raw, dict):
+            raw = raw.get("events") or raw.get("oneleg_ban") or []
+        return {str(x) for x in (raw or []) if x}
+    except Exception:
+        return set()
+
+
+def save_oneleg_ban(ban) -> None:
+    evs = sorted({str(x) for x in (ban or []) if x})
+    BAN_PATH.write_text(json.dumps({"events": evs}, indent=2) + "\n")
+
 def has_sibling(ticker: str, tickers) -> bool:
     pref = event_prefix(ticker)
     return any(x != ticker and event_prefix(x) == pref for x in tickers)
@@ -436,12 +476,14 @@ def _approx_reserved(pairs, state: dict) -> float:
 
 
 def reserved_dollars(orders, idx: int, cache: dict | None = None, state: dict | None = None) -> float:
-    """Cash tied up in resting bids on one shard (qty * price)."""
+    """Cash tied up in resting bids on one shard (qty * price). Flatten asks do not lock cash."""
     tot = 0.0
     n = 0
     shard_orders = []
     for o in orders or []:
         if order_exchange_index(o, cache) != int(idx):
+            continue
+        if not order_is_yes_bid(o):
             continue
         n += 1
         shard_orders.append(o)
@@ -522,8 +564,30 @@ def is_harlla(s: str) -> bool:
     return "HARLLA" in (s or "").upper()
 
 
-def live_filter_reason(tw: dict, *, leftover: bool = False) -> str | None:
-    """None => book filters pass for a live post_only 2-way rest."""
+def is_lopsided_pair(ya, yb) -> bool:
+    """Wing outside 25-75c or the two bids differ by more than ~35c."""
+    if ya is None or yb is None:
+        return False
+    try:
+        a, b = float(ya), float(yb)
+    except (TypeError, ValueError):
+        return False
+    lo, hi = LEFTOVER_INPLAY_BID_LO, LEFTOVER_INPLAY_BID_HI
+    if a < lo - 1e-12 or a > hi + 1e-12 or b < lo - 1e-12 or b > hi + 1e-12:
+        return True
+    return abs(a - b) > LEFTOVER_INPLAY_BID_GAP + 1e-12
+
+
+def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = True) -> str | None:
+    """None => book filters pass for a live post_only 2-way rest.
+
+    placement=True (maybe_live_rest / new candidates, and OUR resting quote
+    in release_stale_leftover_rest): LIVE_BID 35-65 and is_lopsided_pair on
+    every 2-way, pregame included.
+    placement=False (touch-based leftover rotate): do not cancel solely because
+    the touch walked off band; rest_allin>0.99 and leftover in-play lopsided
+    still rotate. OUR posted prices are checked with placement=True separately.
+    """
     a, b = tw.get("a") or "", tw.get("b") or ""
     if is_harlla(a) or is_harlla(b):
         return "skip HARLLA (already live; do not duplicate)"
@@ -536,10 +600,19 @@ def live_filter_reason(tw: dict, *, leftover: bool = False) -> str | None:
     ba, bb = tw.get("yes_a"), tw.get("yes_b")
     if ba is None or bb is None:
         return "missing bids"
-    if not (LIVE_BID_LO - 1e-12 <= float(ba) <= LIVE_BID_HI + 1e-12):
-        return f"wing a={ba:.2f}"
-    if not (LIVE_BID_LO - 1e-12 <= float(bb) <= LIVE_BID_HI + 1e-12):
-        return f"wing b={bb:.2f}"
+    if placement:
+        if not (LIVE_BID_LO - 1e-12 <= float(ba) <= LIVE_BID_HI + 1e-12):
+            return f"wing a={ba:.2f}"
+        if not (LIVE_BID_LO - 1e-12 <= float(bb) <= LIVE_BID_HI + 1e-12):
+            return f"wing b={bb:.2f}"
+        # All 2-way live rests (first pair and leftover, pregame too).
+        # 25/70 and 70/25 must not stack. Gap LEFTOVER_INPLAY_BID_GAP (0.35).
+        if is_lopsided_pair(ba, bb):
+            tag = "leftover " if leftover else ""
+            return f"{tag}lopsided {float(ba):.2f}/{float(bb):.2f}"
+    elif leftover and tw.get("in_play") and is_lopsided_pair(ba, bb):
+        # Keep-working: leftover in-play 25-75 / gap 35 still rotates CWS/MIN.
+        return f"leftover in-play lopsided {float(ba):.2f}/{float(bb):.2f}"
     if float(ba) + float(bb) > LIVE_REST_MAX + 1e-12:
         if leftover:
             return "idle cash but rest_allin>0.99"
@@ -548,6 +621,14 @@ def live_filter_reason(tw: dict, *, leftover: bool = False) -> str | None:
     # 7-10c books can print bid_sum~93c and are not locks.
     if sa is None or sb is None or float(sa) > LIVE_SPREAD_MAX + 1e-12 or float(sb) > LIVE_SPREAD_MAX + 1e-12:
         return "wide spread"
+    tr, ta = tw.get("rest"), tw.get("take")
+    # Fat take-rest = adverse-selection magnet (challenger upgrade one-legs).
+    if (
+        tr is not None
+        and ta is not None
+        and float(ta) - float(tr) > LIVE_TAKE_REST_GAP_MAX + 1e-12
+    ):
+        return "fat take-rest gap"
     ra = tw.get("rest_allin")
     # All live rests: rest_allin <= 0.99 (~1c after M=0.5). 0.99 raw is 1.008 all-in.
     if ra is None or float(ra) > LIVE_REST_ALLIN_MAX + 1e-12:
@@ -740,6 +821,449 @@ def place_yes_post_only(k: Kalshi, ticker: str, price: float, count: int, exchan
     return k.post("/portfolio/events/orders", body)
 
 
+def place_yes_post_only_sell(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
+    """Maker flatten: sell YES. post_only stays true. No reduce_only (Kalshi: IOC only). Never >= $1.00 / 101c."""
+    if float(price) >= 1.0 - 1e-12 or float(price) <= 0:
+        raise RuntimeError("refuse sell px outside (0, 1.00) (no lift / no 101c)")
+    body = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": "ask",  # sell YES
+        "count": f"{int(count):.2f}",
+        "price": f"{float(price):.4f}",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": True,
+        "subaccount": 0,
+        "exchange_index": int(exchange_index),
+    }
+    return k.post("/portfolio/events/orders", body)
+
+
+def place_yes_ioc_sell(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
+    """IOC flatten: sell YES at the live bid. post_only=False. Never >= $1.00 / 101c."""
+    if float(price) >= 1.0 - 1e-12 or float(price) <= 0:
+        raise RuntimeError("refuse sell px outside (0, 1.00) (no lift / no 101c)")
+    body = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": "ask",
+        "action": "sell",
+        "count": f"{int(count):.2f}",
+        "price": f"{float(price):.4f}",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "reduce_only": True,
+        "subaccount": 0,
+        "exchange_index": int(exchange_index),
+    }
+    try:
+        return k.post("/portfolio/events/orders", body)
+    except Exception:
+        body2 = dict(body)
+        body2.pop("reduce_only", None)
+        body2.pop("action", None)
+        try:
+            return k.post("/portfolio/events/orders", body2)
+        except Exception:
+            body3 = {
+                "ticker": ticker,
+                "client_order_id": str(uuid.uuid4()),
+                "side": "yes",
+                "action": "sell",
+                "count": f"{int(count):.2f}",
+                "yes_price_dollars": f"{float(price):.4f}",
+                "time_in_force": "immediate_or_cancel",
+                "self_trade_prevention_type": "taker_at_cross",
+                "post_only": False,
+                "subaccount": 0,
+                "exchange_index": int(exchange_index),
+            }
+            return k.post("/portfolio/events/orders", body3)
+
+
+def order_is_yes_bid(o: dict) -> bool:
+    side = str(o.get("side") or o.get("book_side") or "").lower()
+    action = str(o.get("action") or "").lower()
+    if side in ("ask", "no"):
+        return False
+    if action == "sell":
+        return False
+    return True
+
+
+def flatten_lock_open(ev: str = "") -> list[str]:
+    """Sibling flatten in flight (FLATTEN_CWS.lock). Do not race it."""
+    hits = []
+    evu = (ev or "").upper()
+    for path in DIR.glob("FLATTEN_*.lock"):
+        tag = path.stem[len("FLATTEN_"):].upper()
+        if not tag:
+            hits.append(path.name)
+        elif not evu or tag in evu or evu in tag:
+            hits.append(path.name)
+    return hits
+
+
+def maker_sell_px(yes_bid, yes_ask=None):
+    """post_only SELL at/near bid. Selling at the bid takes — rest 1c above. Never >= $1."""
+    if yes_bid is None:
+        return None
+    try:
+        bid = round(float(yes_bid), 2)
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0:
+        return None
+    px = round(bid + 0.01, 2)
+    if yes_ask is not None:
+        try:
+            ask = round(float(yes_ask), 2)
+        except (TypeError, ValueError):
+            ask = None
+        else:
+            if ask > bid + 1e-12:
+                px = min(px, ask)
+    if px >= 1.0 - 1e-12 or px <= 0:
+        return None
+    return px
+
+
+def rest_is_stale(rest_px, live_bid) -> bool:
+    """True when our maker rest is more than ~2c below the live bid."""
+    if rest_px is None or live_bid is None:
+        return False
+    try:
+        return float(live_bid) - float(rest_px) > ONELEG_STALE_C + 1e-12
+    except (TypeError, ValueError):
+        return False
+
+
+def _yes_touch(ticker: str, state: dict, books=None):
+    if not ticker:
+        return None, None
+    if books is not None:
+        b = books.get(ticker)
+        if b is not None:
+            q = b.quote() if hasattr(b, "quote") else b
+            if isinstance(q, dict) and q.get("yes_bid") is not None:
+                ask = q.get("yes_ask")
+                return float(q["yes_bid"]), (None if ask is None else float(ask))
+    for tw in state.get("two_ways_snap") or []:
+        if tw.get("a") == ticker and tw.get("yes_a") is not None:
+            ask = tw.get("ask_a")
+            return float(tw["yes_a"]), (None if ask is None else float(ask))
+        if tw.get("b") == ticker and tw.get("yes_b") is not None:
+            ask = tw.get("ask_b")
+            return float(tw["yes_b"]), (None if ask is None else float(ask))
+    hit = (state.get("yes_touch_cache") or {}).get(ticker)
+    if hit and time.monotonic() - float(hit[2]) < 4.0:
+        return hit[0], hit[1]
+    return None, None
+
+
+def _fetch_yes_touch(k: Kalshi, ticker: str, state: dict):
+    bid, ask = None, None
+    try:
+        data = k.get(f"/markets/{ticker}")
+        m = data.get("market") or data
+        raw_b = m.get("yes_bid_dollars") if m.get("yes_bid_dollars") is not None else m.get("yes_bid")
+        raw_a = m.get("yes_ask_dollars") if m.get("yes_ask_dollars") is not None else m.get("yes_ask")
+        bid = to_dollars(raw_b)
+        ask = to_dollars(raw_a)
+    except Exception as e:
+        log(f"ONELEG touch miss {ticker} {safe_err(e)}")
+    state.setdefault("yes_touch_cache", {})[ticker] = (bid, ask, time.monotonic())
+    return bid, ask
+
+
+def _oneleg_log(state: dict, rec: dict) -> None:
+    key = (
+        f"{rec.get('event')}|{rec.get('action')}|{int(bool(rec.get('stale')))}|"
+        f"{int(bool(rec.get('lopsided')))}"
+    )
+    ts = state.setdefault("oneleg_log_ts", {})
+    now = time.monotonic()
+    if now - float(ts.get(key) or 0) < 20.0:
+        return
+    ts[key] = now
+    extra = f" {rec.get('flatten')}" if rec.get("flatten") else ""
+    log(
+        f"ONELEG {rec.get('event')} filled={rec.get('filled')} "
+        f"{rec.get('filled_qty')}@{rec.get('filled_px')} "
+        f"rest={rec.get('rest')} {rec.get('rest_qty')}@{rec.get('rest_px')} "
+        f"live_bid={rec.get('live_rest_bid')} stale={int(bool(rec.get('stale')))} "
+        f"lopsided={int(bool(rec.get('lopsided')))} → {rec.get('action')}{extra}"
+    )
+
+
+def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
+    """One-leg fill of a 2-way: never a completed lock. Maker SELL first (target or 1c above bid); IOC only after 45s if bid walked."""
+    positions = state.get("open_positions") or []
+    orders = state.get("resting") or []
+    by_ev: dict[str, list] = {}
+    for p in positions:
+        t = p.get("ticker") or ""
+        if not t:
+            continue
+        try:
+            pv = float(p.get("position") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(pv) <= 1e-9:
+            continue
+        by_ev.setdefault(event_prefix(t), []).append(p)
+    if not by_ev:
+        state["oneleg"] = None
+        return None
+
+    now = time.monotonic()
+    recs = []
+    acted = None
+    for ev, plist in by_ev.items():
+        if is_harlla(ev):
+            continue
+        sizes = []
+        for p in plist:
+            try:
+                sizes.append(abs(float(p.get("position") or 0)))
+            except (TypeError, ValueError):
+                pass
+        if len(plist) == 2 and len(sizes) == 2 and abs(sizes[0] - sizes[1]) <= 1e-6:
+            continue
+        # Flatten-price path only when exactly one leg has inventory.
+        if len(plist) != 1:
+            continue
+        filled = max(plist, key=lambda p: abs(float(p.get("position") or 0)))
+        ft = filled.get("ticker") or ""
+        try:
+            fqty = abs(float(filled.get("position") or 0))
+            fsigned = float(filled.get("position") or 0)
+        except (TypeError, ValueError):
+            fqty, fsigned = 0.0, 0.0
+        fill_px = None
+        try:
+            exp = filled.get("exposure")
+            if exp is not None and fqty > 0:
+                fill_px = abs(float(exp)) / fqty
+        except (TypeError, ValueError):
+            fill_px = None
+        rest_legs = [
+            o
+            for o in orders
+            if event_prefix(order_ticker(o)) == ev
+            and order_ticker(o) != ft
+            and order_is_yes_bid(o)
+            and order_remaining_qty(o) > 0
+            and order_oid(o)
+        ]
+        already_ask = [
+            o
+            for o in orders
+            if order_ticker(o) == ft
+            and not order_is_yes_bid(o)
+            and order_remaining_qty(o) > 0
+        ]
+        rest_t = order_ticker(rest_legs[0]) if rest_legs else None
+        rest_px = order_price_dollars(rest_legs[0]) if rest_legs else None
+        rest_q = order_remaining_qty(rest_legs[0]) if rest_legs else 0.0
+        live_rest, _ask_r = _yes_touch(rest_t, state, books) if rest_t else (None, None)
+        live_fill, live_fill_ask = _yes_touch(ft, state, books)
+        if rest_t and live_rest is None:
+            live_rest, _ask_r = _fetch_yes_touch(k, rest_t, state)
+        if live_fill is None:
+            live_fill, live_fill_ask = _fetch_yes_touch(k, ft, state)
+        if fill_px is None:
+            fill_px = live_fill
+        rec = {
+            "event": ev,
+            "filled": ft,
+            "filled_qty": fqty,
+            "filled_px": None if fill_px is None else round(float(fill_px), 4),
+            "rest": rest_t,
+            "rest_px": None if rest_px is None else round(float(rest_px), 4),
+            "rest_qty": rest_q,
+            "live_rest_bid": live_rest,
+            "live_fill_bid": live_fill,
+            "stale": False,
+            "lopsided": False,
+            "action": None,
+            "ts_et": datetime.now(ET).strftime("%H:%M:%S ET"),
+        }
+        locks = flatten_lock_open(ev)
+        if locks:
+            rec["action"] = "ONELEG flatten-lock skip"
+            recs.append(rec)
+            leftover_note(state, None, 0, 0, f"ONELEG {ev} flatten lock {locks[0]}")
+            _oneleg_log(state, rec)
+            continue
+        rec["action"] = "NAKED_FLATTEN"
+        cache = state.setdefault("idx_cache", {})
+        state.setdefault("oneleg_ban", set()).add(ev)
+        save_oneleg_ban(state["oneleg_ban"])
+        # Cancel ALL missing-wing rests and extra bids on the filled ticker.
+        # Never keep the rest. Never lift the missing wing. Never 101c.
+        for o in rest_legs:
+            t = order_ticker(o)
+            idx = cache.get(t)
+            if idx is None:
+                idx = guess_exchange_index(t)
+            cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t)
+            log(
+                f"ONELEG cancel rest {t} px={order_price_dollars(o):.2f} "
+                f"live={live_rest}"
+            )
+        extra_bids = [
+            o
+            for o in orders
+            if order_ticker(o) == ft
+            and order_is_yes_bid(o)
+            and order_remaining_qty(o) > 0
+            and order_oid(o)
+        ]
+        for o in extra_bids:
+            t = order_ticker(o)
+            idx = cache.get(t)
+            if idx is None:
+                idx = guess_exchange_index(t)
+            cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t)
+            log(f"ONELEG cancel extra bid {t} oid={order_oid(o)}")
+        sell_note = None
+        if fsigned <= 0:
+            sell_note = "ORCH short/NO inventory; no YES sell"
+        else:
+            qty = max(0, min(CAP_C, int(fqty)))
+            try:
+                cost = None if fill_px is None else float(fill_px)
+            except (TypeError, ValueError):
+                cost = None
+            target = None if cost is None else round(cost - 0.01, 2)
+            if target is not None and (target <= 0 or target >= 1.0 - 1e-12):
+                target = None
+            try:
+                live_bid = None if live_fill is None else float(live_fill)
+            except (TypeError, ValueError):
+                live_bid = None
+            idx = cache.get(ft)
+            if idx is None:
+                idx = market_exchange_index(k, ft, cache)
+            placed_at = float(state.get("oneleg_action_ts") or 0.0)
+            if placed_at > now + 1.0:
+                placed_at = 0.0
+            wait_s = (now - placed_at) if placed_at > 0 else None
+            # Maker px: never post_only at/below live_bid (Kalshi rejects the cross).
+            maker_px = target
+            if target is not None and live_bid is not None and live_bid + 1e-12 >= target:
+                maker_px = round(min(0.99, float(live_bid) + 0.01), 2)
+            if maker_px is not None and (maker_px <= 0 or maker_px >= 1.0 - 1e-12):
+                maker_px = None
+            if (
+                maker_px is not None
+                and live_bid is not None
+                and maker_px <= live_bid + 1e-12
+            ):
+                maker_px = None
+            near_asks = []
+            off_asks = []
+            if maker_px is not None:
+                for o in already_ask:
+                    try:
+                        opx = float(order_price_dollars(o))
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(opx - maker_px) <= ONELEG_NEAR_C + 1e-12:
+                        near_asks.append(o)
+                    else:
+                        off_asks.append(o)
+            else:
+                off_asks = list(already_ask)
+
+            def _cancel_asks(asks):
+                for o in asks:
+                    t = order_ticker(o)
+                    oid = order_oid(o)
+                    if not oid:
+                        continue
+                    cidx = cache.get(t)
+                    if cidx is None:
+                        cidx = guess_exchange_index(t)
+                    cancel_our_order(k, oid, exchange_index=cidx, market_ticker=t)
+
+            def _ioc_at_bid(why: str) -> str:
+                if live_bid is None or live_bid <= 0 or live_bid >= 1.0 - 1e-12 or qty <= 0:
+                    return "ORCH cannot IOC-sell (no bid / no 101c)"
+                px = round(float(live_bid), 4)
+                _cancel_asks(already_ask)
+                try:
+                    place_yes_ioc_sell(k, ft, px, qty, int(idx))
+                    rec["action"] = why
+                    log(f"{why} {ft} IOC sell YES {qty}@{px:.2f} cost={cost} target={target}")
+                    return f"IOC SELL {qty}@{px:.2f}"
+                except Exception as e:
+                    log(f"{why} {ft} IOC sell fail {safe_err(e)} (no lift)")
+                    return f"ORCH sell fail {safe_err(e)}"
+
+            if qty <= 0:
+                sell_note = "ORCH cannot sell (qty=0)"
+            elif target is None:
+                sell_note = "ORCH cannot flatten (bad cost/target / no 101c)"
+            else:
+                give_up = (
+                    bool(already_ask)
+                    and wait_s is not None
+                    and wait_s >= ONELEG_MAKER_WAIT_S
+                    and live_bid is not None
+                    and live_bid < target - ONELEG_GIVEUP_UNDER
+                )
+                if give_up:
+                    rec["action"] = "ONELEG give-up take"
+                    sell_note = _ioc_at_bid("ONELEG give-up take")
+                elif near_asks or (wait_s is not None and wait_s < ONELEG_MAKER_WAIT_S):
+                    rec["action"] = "ONELEG maker-wait"
+                    if placed_at <= 0:
+                        state["oneleg_action_ts"] = now
+                    px_s = (
+                        f"{maker_px:.2f}" if maker_px is not None else f"{target:.2f}"
+                    )
+                    sell_note = (
+                        f"maker-wait {qty}@{px_s} live_bid={live_bid} "
+                        f"wait={0 if wait_s is None else wait_s:.0f}s"
+                    )
+                elif maker_px is None:
+                    rec["action"] = "ONELEG maker-wait"
+                    sell_note = (
+                        f"maker-wait no-cross {qty} live_bid={live_bid} "
+                        f"target={target}"
+                    )
+                    log(
+                        f"ONELEG maker-wait {ft} skip post_only "
+                        f"(would cross live_bid={live_bid} / no 101c)"
+                    )
+                else:
+                    _cancel_asks(off_asks)
+                    try:
+                        place_yes_post_only_sell(k, ft, float(maker_px), qty, int(idx))
+                        state["oneleg_action_ts"] = now
+                        rec["action"] = "ONELEG maker-wait"
+                        sell_note = f"maker rest SELL {qty}@{maker_px:.2f}"
+                        log(
+                            f"ONELEG maker-wait {ft} rest post_only SELL "
+                            f"{qty}@{maker_px:.2f} live_bid={live_bid} target={target}"
+                        )
+                    except Exception as e:
+                        sell_note = f"ORCH maker rest fail {safe_err(e)}"
+                        log(f"ONELEG maker rest fail {ft} {safe_err(e)} (no lift)")
+        rec["flatten"] = sell_note
+        recs.append(rec)
+        leftover_note(state, None, 0, 0, f"NAKED_FLATTEN {ev} {sell_note}")
+        state["naked_flatten"] = rec
+        _oneleg_log(state, rec)
+        acted = rec
+    state["oneleg"] = recs or None
+    return acted
+
+
 def cancel_our_order(
     k: Kalshi,
     oid: str,
@@ -764,7 +1288,7 @@ def cancel_our_order(
         return False
 
 
-def refresh_portfolio(k: Kalshi, watch: list, state: dict) -> None:
+def refresh_portfolio(k: Kalshi, watch: list, state: dict, books=None) -> None:
     cache = state.setdefault("idx_cache", {})
     idxs = {0, 3}
     for w in watch or []:
@@ -812,6 +1336,11 @@ def refresh_portfolio(k: Kalshi, watch: list, state: dict) -> None:
     state["open_pos_events"] = open_position_events(positions)
     state["pos_failed_shards"] = pos_failed
     state["port_ts"] = time.monotonic()
+    if LIVE_FIRE:
+        try:
+            handle_oneleg_inventory(k, state, books)
+        except Exception as e:
+            log(f"ONELEG handle {safe_err(e)}")
 
 
 
@@ -904,10 +1433,11 @@ def release_stale_leftover_rest(
     # for one candidate — 18:22 ET dumped BOTH BOSNYYG1+G2 for one BUSBON slot.
     upgrade_picks: list[tuple[float, str, dict]] = []
     pos_evs = set(state.get("open_pos_events") or [])
-    skip_up = bool(
-        candidate_tw is not None
-        and (candidate_tw.get("in_play") or (cand_ev in pos_evs))
-    )
+    # Only skip upgrades into inventory we already hold. Blanket in_play skip
+    # froze BOSNYYG2 while HOUNYM cleared filters at 0.928 all-in (20:12:59 ET)
+    # and only logged "cap" — live books still need the 1.5c upgrade gate +
+    # spread/wing filters; they just must be allowed to compete for the slot.
+    skip_up = bool(candidate_tw is not None and cand_ev in pos_evs)
 
     def _cancel_ev(ev: str, why: str, tw) -> bool:
         legs = [
@@ -953,20 +1483,42 @@ def release_stale_leftover_rest(
             why = "missing snap (cannot verify leftover)"
         else:
             miss.pop(ev, None)
-            why = live_filter_reason(tw, leftover=True)
+            why = live_filter_reason(tw, leftover=True, placement=False)
             # Prefer OUR resting prices over the touch. Touch flicking to 99c
             # must not cancel a still-valid 96-97c post_only pair.
+            # OUR posted wings MUST stay in LIVE_BID 35-65 (and not lopsided):
+            # placement rejects new 32/65, but keep-working used to leave
+            # POTVAL 32+65 / VANNOR 33+65 sitting for hours and cap better
+            # in-band books (VIDBOU 47/50, OLIBRA 48/49). Touch flick alone
+            # still does not cancel; only our resting quote does.
             our = resting_pair_quote(orders, ev)
-            if why is not None and our is not None:
-                our_why = live_filter_reason(our, leftover=True)
-                if our_why is None:
-                    why = None
-                    tw = our  # upgrade compare uses our all-in
-                else:
-                    why = f"our orders {our_why}"
+            if our is not None and tw is not None:
+                our["in_play"] = tw.get("in_play")
+            if our is not None:
+                # Band/lopsided on OUR prices (placement=True); rest_allin /
+                # spread / take-rest keep placement=False so a touch walk
+                # off 99c does not dump a still-valid 96-97c post_only.
+                our_band = live_filter_reason(our, leftover=True, placement=True)
+                band_hit = (
+                    our_band is not None
+                    and (
+                        our_band.startswith("wing ")
+                        or "lopsided" in our_band
+                    )
+                )
+                if band_hit:
+                    why = f"our orders {our_band}"
                     tw = our
-            elif our is not None:
-                tw = our
+                elif why is not None:
+                    our_why = live_filter_reason(our, leftover=True, placement=False)
+                    if our_why is None:
+                        why = None
+                        tw = our  # upgrade compare uses our all-in
+                    else:
+                        why = f"our orders {our_why}"
+                        tw = our
+                else:
+                    tw = our
             # Queue upgrades; cancel the single worst after the stale pass.
             if why is None and allow_upgrade and cand_ra is not None and not skip_up:
                 try:
@@ -1020,6 +1572,8 @@ def leftover_note(state: dict, cash, qty, notional, reason: str | None = None) -
 
 
 def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str:
+    if event_prefix(tw["a"]) in (state.get("oneleg_ban") or set()):
+        return "oneleg ban — already flattened, do not re-buy"
     cache = state.setdefault("idx_cache", {})
     idx = market_exchange_index(k, tw["a"], cache)
     idx_b = market_exchange_index(k, tw["b"], cache)
@@ -1041,8 +1595,18 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     pos_events = open_position_events(positions)
     locked = open_pos_is_locked(positions)
     if pos_events and not locked:
-        leftover_note(state, None, 0, 0, "naked inventory")
-        return "naked inventory"
+        # One-leg fill is not a completed lock. Always flatten; never keep/lift.
+        try:
+            handle_oneleg_inventory(k, state, None)
+        except Exception as e:
+            log(f"ONELEG handle {safe_err(e)}")
+        # Only abort THIS event (never buy the missing wing). Other 2-ways may
+        # leftover-rest; DET flatten used to NAKED_FLATTEN-abort SVRROY 97.8c.
+        evn = event_prefix(tw["a"])
+        if evn in pos_events or evn in (state.get("oneleg_ban") or set()):
+            why = state.get("leftover_sit_reason") or "ONELEG"
+            leftover_note(state, None, 0, 0, why)
+            return why
     if event_prefix(tw["a"]) in pos_events:
         return "already have inventory"
     tickers = {order_ticker(o) for o in orders}
@@ -1050,7 +1614,10 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
         return "leg already resting"
     pairs = two_way_resting_events(orders)
     n_rest_pairs = len(pairs)
-    leftover = n_rest_pairs >= 1  # extra rest from leftover cash; no inventory lock required
+    # Filled locked 2-ways leave n_rest_pairs=0 but cash is leftover — do NOT
+    # treat as a first-pair fund ($12 from shard 0) or we LIVE-fail spam.
+    n_inv_pairs = len(pos_events) if locked else 0
+    leftover = n_rest_pairs >= 1 or n_inv_pairs >= 1
     reason = live_filter_reason(tw, leftover=leftover)
     if reason:
         if leftover:
@@ -1072,7 +1639,8 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     free = max(0.0, float(cash) - float(reserved))
     state.setdefault("free_cash", {})[str(idx)] = round(free, 4)
     n_allowed = max_pair_cap(cash)
-    if n_rest_pairs == 0:
+    # Only force a first-pair slot when we have neither resting nor filled locks.
+    if n_rest_pairs == 0 and n_inv_pairs == 0:
         n_allowed = max(n_allowed, 1)
     state["pair_cap"] = n_allowed
     state["n_live_pairs"] = n_rest_pairs
@@ -1091,6 +1659,11 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
         free = max(0.0, float(cash) - float(reserved))
         state.setdefault("free_cash", {})[str(idx)] = round(free, 4)
 
+    if leftover and n_allowed <= 0:
+        msg = f"idle cash below pair unit free={free:.2f} inv={n_inv_pairs}"
+        leftover_note(state, free, 0, 0, msg)
+        log(f"LIVE leftover sit {event_prefix(tw['a'])} {msg}")
+        return msg
     if leftover:
         at_cap = n_rest_pairs >= n_allowed
         if release_stale_leftover_rest(
@@ -1145,7 +1718,13 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
         if qty <= 0:
             return "no depth"
         if cash < CLIP_NOTIONAL:
-            fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
+            try:
+                fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
+            except RuntimeError as e:
+                # Shard 0 only has the $0.50 keep after MLB fills — sit, don't raise.
+                msg = f"unfunded idx={idx} cash={cash:.2f} ({e})"
+                log(f"LIVE sit {event_prefix(tw['a'])} {msg}")
+                return msg
             cash = shard_balance_dollars(k, idx)
             state["shard_balances"][str(idx)] = round(cash, 4)
             qty = live_qty(qa, qb, cash=cash, yes_a=tw.get("yes_a"), yes_b=tw.get("yes_b"))
@@ -1165,7 +1744,10 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
             log(f"SHARD miss leftover: {tw['a']} idx={idx} cash={cash:g} sit (no transfer)")
             return "leftover unfunded; sit no transfer"
         log(f"SHARD miss: {tw['a']} idx={idx} cash={cash:g} → transfer ${FUND_DOLLARS:g}")
-        fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
+        try:
+            fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
+        except RuntimeError as e:
+            return f"unfunded-404 fund failed ({e})"
         return "unfunded-404 retried fund; skip this tick"
     except Exception:
         if oid_a:
@@ -1255,6 +1837,7 @@ def pick_watch(k: Kalshi):
     today = now.astimezone(ET).date()
     tomorrow = today + timedelta(days=1)
     leftover_mode = False
+    ban = load_oneleg_ban()
     try:
         st = json.loads(STATUS.read_text())
         leftover_mode = (
@@ -1265,6 +1848,7 @@ def pick_watch(k: Kalshi):
                 and int(st.get("n_open_pos") or 0) >= 2
             )
         )
+        ban |= {str(x) for x in (st.get("oneleg_ban") or []) if x}
     except Exception:
         leftover_mode = False
     cands = []
@@ -1435,11 +2019,14 @@ def pick_watch(k: Kalshi):
                     }
                 )
     # Full 2-way events (both legs). Live pairs first, then restable
-    # 2-ways (both YES in LIVE_BID_LO..HI and yb_sum<=LIVE_REST_MAX), then
+    # 2-ways (both YES in LIVE_BID_LO..HI, yb_sum<=LIVE_REST_MAX, and
+    # rest_allin<=LIVE_REST_ALLIN_MAX after M=0.5 sports fees), then
     # series_rank (MLB/NFL/ATP/WTA before NCAAF), then volume. Do NOT prefer
-    # 50/50 over 19/80 — 19/80 is restable. Volume-only rank dropped live ATP
+    # 50/50 over other in-band 2-ways. Band is LIVE_BID_LO..HI (35-65);
+    # 19/80 is no longer restable. Volume-only rank dropped live ATP
     # FEAROD (52/45 rest 97c, ~2M vol) behind 100c NFL; unused series_rank let
-    # ghost NCAAF steal slots from tennis.
+    # ghost NCAAF steal slots from tennis. Raw<=0.99 without fee check let
+    # DETIND/BOSNYY/PARMER hog slots while sitting rest_allin>0.99.
     by_ev = {}
     for c in cands:
         by_ev.setdefault(c.get("event") or c["ticker"], []).append(c)
@@ -1456,6 +2043,15 @@ def pick_watch(k: Kalshi):
         if pair and pair[0].get("yb") is not None and pair[1].get("yb") is not None:
             ya, yb = pair[0]["yb"], pair[1]["yb"]
             yb_sum = ya + yb
+        # Align with live gate: raw yb_sum<=0.99 still marks DETIND/BOSNYY/
+        # PARMER "actionable" while rest_allin 0.996-1.008 fails LIVE_REST_ALLIN_MAX
+        # and sits forever, crowding real 97c ATP (SVRROY/BASSCH) off the watch.
+        rest_allin_est = None
+        if yb_sum is not None and ya is not None and yb is not None:
+            qty_est = 10
+            fy = taker_fee(qty_est, float(ya), SPORTS_FEE_M)
+            fn = taker_fee(qty_est, float(yb), SPORTS_FEE_M)
+            rest_allin_est = round(yb_sum + (fy + fn) / qty_est, 4)
         actionable = bool(
             pair
             and ya is not None
@@ -1464,25 +2060,38 @@ def pick_watch(k: Kalshi):
             and LIVE_BID_LO - 1e-12 <= yb <= LIVE_BID_HI + 1e-12
             and yb_sum <= LIVE_REST_MAX + 1e-12
             and yb_sum >= 0.90  # <0.90 is a missing outcome (3-way soccer)
+            and rest_allin_est is not None
+            and rest_allin_est <= LIVE_REST_ALLIN_MAX + 1e-12
         )
         # series_rank was computed per-leg but unused; NCAAF volume was
         # crowding ATP/MLB off the 20-slot watch (METOWS/LAFGTWN/UVAWPRE).
         series_rank = min(int(x.get("series_rank") or 1) for x in use)
         day = min(int(x.get("day") if x.get("day") is not None else 9) for x in use)
+        skip_unpinned = bool(
+            in_play
+            and pair
+            and ya is not None
+            and yb is not None
+            and is_lopsided_pair(ya, yb)
+        )
         scored.append(
             {
                 "ev": ev,
                 "legs": use,
                 "yb_sum": yb_sum,
+                "rest_allin_est": rest_allin_est,
                 "day": day,
                 "actionable": actionable,
+                "skip_unpinned": skip_unpinned,
                 "rank": (
                     0 if pair else 1,  # 2-way GAME/MATCH before live props
                     0 if actionable else 1,
                     0 if in_play else 1,
                     max(day, 0),  # today (0) before Sep NFL (3)
                     series_rank,  # MLB/NFL/ATP/WTA=0 before NCAAF=2
-                    yb_sum if yb_sum is not None else 9.0,  # tighter rest before volume
+                    # fee-adjusted tighter rest before volume (raw 0.99 looked
+                    # tight but sits after M=0.5 sports fees)
+                    rest_allin_est if rest_allin_est is not None else 9.0,
                     -vol,
                 ),
             }
@@ -1491,14 +2100,25 @@ def pick_watch(k: Kalshi):
     watch = []
     have = set()
 
-    def take(src, limit):
+    def take(src, limit, *, keep_lopsided=False):
         for row in src:
             if len(watch) >= limit:
                 return
-            for leg in row["legs"]:
+            evn = row.get("ev") or ""
+            if evn in ban:
+                continue
+            if (not keep_lopsided) and row.get("skip_unpinned"):
+                continue
+            pending = [leg for leg in row["legs"] if leg["ticker"] not in have]
+            if not pending:
+                continue
+            # Need both winner legs. 20th slot used to take MENHUA-MEN without HUA.
+            if len(pending) >= 2 and len(watch) + len(pending) > limit:
+                continue
+            for leg in pending:
                 if len(watch) >= limit:
                     return
-                if leg["ticker"] in have:
+                if event_prefix(leg["ticker"]) in ban:
                     continue
                 have.add(leg["ticker"])
                 watch.append(leg)
@@ -1508,6 +2128,8 @@ def pick_watch(k: Kalshi):
         # HARLLA even after settlement, then the loop below invented 50/50
         # "pinned live rest" ghosts that ate 2/20 slots (PACAND 98c dropped).
         # LIVE_SKIP_OIDS still skips those oids so we never duplicate/cancel them.
+        # Also pin recent take_lock flashes so BALATH-style 0.998 locks cannot
+        # rotate off the 20-slot watch before the hourly (paper only; no auto-lift).
         pins = []
         try:
             st = json.loads(STATUS.read_text())
@@ -1523,6 +2145,18 @@ def pick_watch(k: Kalshi):
             for t in st.get("open_pos_tickers") or []:
                 if t and t not in pins:
                     pins.append(t)
+            def _pin_leg(t):
+                if t and t not in pins:
+                    pins.append(t)
+            for pk in st.get("take_locks") or []:
+                _pin_leg(pk.get("a"))
+                _pin_leg(pk.get("b"))
+            tlb = st.get("take_lock_best") or {}
+            if isinstance(tlb, dict):
+                for pk in tlb.values():
+                    if isinstance(pk, dict):
+                        _pin_leg(pk.get("a"))
+                        _pin_leg(pk.get("b"))
         except Exception:
             pass
         return pins
@@ -1536,7 +2170,7 @@ def pick_watch(k: Kalshi):
         row for row in scored
         if any(event_prefix(leg["ticker"]) in pin_pref for leg in row["legs"])
     ]
-    take(pinned_rows, WATCH_N)
+    take(pinned_rows, WATCH_N, keep_lopsided=True)
     for t in pin_ts:
         if t in have or len(watch) >= WATCH_N:
             continue
@@ -1572,7 +2206,17 @@ def pick_watch(k: Kalshi):
         )
     )
     take(tight, min(WATCH_N, len(watch) + 8))
-    take(scored, max(0, WATCH_N - 4))
+    # Today NCAAF (day=0, series_rank=2) outranks tomorrow MLB/ATP (day=1,
+    # series_rank=0) in the rank tuple. Tight already drops KXNCAAF; without
+    # scored_noghost, take(scored) refilled the leftover 4 slots with ghost
+    # 10-lot 4-6c NCAAF (ROOSCHS/ALSUFAMU) and rotated BALATH off watch.
+    def _is_ghost_series(row):
+        return any(
+            (leg.get("ticker") or "").upper().startswith(("KXNCAAF", "KXKBO"))
+            for leg in row["legs"]
+        )
+    scored_noghost = [row for row in scored if not _is_ghost_series(row)]
+    take(scored_noghost, max(0, WATCH_N - 4))
     keep = GAME_KEEP if not leftover_mode else tuple(x for x in GAME_KEEP if x != "KXT20MATCH")
     game_scored = [
         row for row in scored
@@ -1583,7 +2227,7 @@ def pick_watch(k: Kalshi):
         )
     ]
     take(game_scored, WATCH_N)
-    take(scored, WATCH_N)
+    take(scored_noghost, WATCH_N)
     log(f"universe nested_mkt={n_mkt} cands={len(cands)} watch={len(watch)}")
     for w in watch[:6]:
         log(
@@ -1730,7 +2374,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                 cache[w["ticker"]] = int(w["exchange_index"])
         if LIVE_FIRE and (time.monotonic() - float(state.get("port_ts") or 0)) >= 8.0:
             try:
-                await asyncio.to_thread(refresh_portfolio, k, watch, state)
+                await asyncio.to_thread(refresh_portfolio, k, watch, state, books)
             except Exception as e:
                 log(f"portfolio refresh {safe_err(e)}")
         quotes = []
@@ -2037,6 +2681,9 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                 "open_pos_events": state.get("open_pos_events") or [],
                 "open_positions": state.get("open_positions") or [],
                 "open_pos_locked": open_pos_is_locked(state.get("open_positions") or []),
+                "oneleg": state.get("oneleg"),
+                "oneleg_ban": sorted(state.get("oneleg_ban") or []),
+                "naked_flatten": state.get("naked_flatten"),
                 "max_live_pairs": MAX_LIVE_PAIRS,
                 "max_stacked_pairs": MAX_STACKED_PAIRS,
                 "edge_peaks": list((state.get("edge_peaks") or {}).values())[:6],
@@ -2066,6 +2713,24 @@ async def main_async():
         f"pair_cash_unit={PAIR_CASH_UNIT} leftover_allin<={LIVE_REST_ALLIN_MAX}"
     )
     k = Kalshi()
+    # Survive 90s watch refresh / seq-gap reconnects. Rebuilding state used to
+    # wipe take_lock_best + edge_peaks so hourly miss-pass never saw flashes
+    # like PACAND take_allin 0.981 (+1.9c) that closed before the next status.
+    persist = {
+        "take_lock_best": {},
+        "take_lock_log_ts": {},
+        "edge_peaks": {},
+        "leftover_rotate_ts": 0.0,
+        "leftover_missing_since": {},
+        "live_skip_log_ts": {},
+        "live_attempt_ts": {},
+        "tw_keys": {},
+        "oneleg": None,
+        "naked_flatten": None,
+        "oneleg_action_ts": 0.0,
+        "oneleg_log_ts": {},
+        "oneleg_ban": list(load_oneleg_ban()),
+    }
 
     while not stop["n"]:
         try:
@@ -2107,8 +2772,21 @@ async def main_async():
                 "leftover_size": 0,
                 "leftover_notional": 0,
                 "leftover_sit_reason": None,
+                "oneleg": persist.get("oneleg"),
+                "naked_flatten": persist.get("naked_flatten"),
+                "oneleg_action_ts": float(persist.get("oneleg_action_ts") or 0.0),
+                "oneleg_log_ts": persist.setdefault("oneleg_log_ts", {}),
+                "oneleg_ban": set(persist.get("oneleg_ban") or []),
                 "port_ts": 0.0,
                 "live_busy": False,
+                "take_lock_best": persist["take_lock_best"],
+                "take_lock_log_ts": persist["take_lock_log_ts"],
+                "edge_peaks": persist["edge_peaks"],
+                "leftover_rotate_ts": persist["leftover_rotate_ts"],
+                "leftover_missing_since": persist["leftover_missing_since"],
+                "live_skip_log_ts": persist["live_skip_log_ts"],
+                "live_attempt_ts": persist["live_attempt_ts"],
+                "tw_keys": persist["tw_keys"],
             }
             ws_task = asyncio.create_task(run_ws(tickers, books, stop, state))
             st_task = asyncio.create_task(status_loop(books, watch, stop, state, k))
@@ -2120,6 +2798,13 @@ async def main_async():
                     await st_task
                 except asyncio.CancelledError:
                     pass
+                # Scalars assigned on state don't share identity; copy back.
+                persist["leftover_rotate_ts"] = float(state.get("leftover_rotate_ts") or 0.0)
+                persist["oneleg"] = state.get("oneleg")
+                persist["naked_flatten"] = state.get("naked_flatten")
+                persist["oneleg_action_ts"] = float(state.get("oneleg_action_ts") or 0.0)
+                persist["oneleg_ban"] = list(state.get("oneleg_ban") or [])
+                save_oneleg_ban(persist["oneleg_ban"])
         except SeqGap as e:
             log(f"{e}; reconnect")
             await asyncio.sleep(1.0)

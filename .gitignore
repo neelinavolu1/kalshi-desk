@@ -16,3 +16,6 @@ today_1pct.json
 *.key
 key_id
 .env
+oneleg_ban.json
+FLATTEN_*.lock
+*.lock
