@@ -395,6 +395,7 @@ _FEE_CACHE: dict[str, dict] = {}
 _FEE_LOCK = threading.Lock()
 _ONELEG_LOCK = threading.Lock()
 _EVENT_SEEN: dict[str, set] = {}
+_EVENT_SEEN_LOADED = False
 
 def event_prefix(ticker: str) -> str:
     if not ticker or ticker.count("-") < 2:
@@ -446,6 +447,21 @@ def take_leg_fee(c: int, px: float, ticker: str, k: Kalshi | None = None) -> flo
 
 def desk_event(kind: str, *, once_key: str | None = None, **fields) -> None:
     """One JSON line per order-went-through / leftover sell / lock. Never keys."""
+    global _EVENT_SEEN_LOADED
+    if not _EVENT_SEEN_LOADED:
+        _EVENT_SEEN_LOADED = True
+        try:
+            if FILLS_LOG.exists():
+                for line in FILLS_LOG.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    prev = json.loads(line)
+                    knd = prev.get("kind")
+                    ok = prev.get("once_key")
+                    if knd and ok:
+                        _EVENT_SEEN.setdefault(str(knd), set()).add(str(ok))
+        except Exception:
+            pass
     if once_key:
         seen = _EVENT_SEEN.setdefault(kind, set())
         if once_key in seen:
@@ -456,6 +472,8 @@ def desk_event(kind: str, *, once_key: str | None = None, **fields) -> None:
         "kind": kind,
         **fields,
     }
+    if once_key:
+        rec["once_key"] = once_key
     try:
         with FILLS_LOG.open("a") as f:
             f.write(json.dumps(rec, default=str) + "\n")
@@ -483,13 +501,23 @@ def log_position_increases(prev, positions) -> None:
         q = _pos_qty(p)
         grew = q - float(old.get(t) or 0)
         if grew > 0.5:
+            px = None
+            try:
+                exp = p.get("exposure")
+                if exp is not None and q > 0:
+                    px = round(abs(float(exp)) / q, 4)
+            except (TypeError, ValueError):
+                px = None
             desk_event(
                 "order_went_through",
+                once_key=f"{t}|{q}",
                 ticker=t,
                 event=event_prefix(t),
                 qty=round(grew, 4),
                 position=round(q, 4),
-                px=p.get("exposure"),
+                px=px,
+                realized_pnl=p.get("realized_pnl"),
+                fees_paid=p.get("fees_paid"),
             )
 
 
@@ -883,6 +911,8 @@ def list_open_positions(k: Kalshi, exchange_index: int):
                 "ticker": t,
                 "position": pv,
                 "exposure": p.get("market_exposure_dollars") or p.get("market_exposure"),
+                "realized_pnl": p.get("realized_pnl_dollars") or p.get("realized_pnl"),
+                "fees_paid": p.get("fees_paid_dollars") or p.get("fees_paid"),
             }
         )
     return out
@@ -1354,16 +1384,26 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
             # 3 minutes (do not sell the leftover this pass). Never a new
             # buy on the missing team.
             cache = state.setdefault("idx_cache", {})
+            still = []
             for o in rest_legs:
                 t = order_ticker(o)
                 idx = cache.get(t)
                 if idx is None:
                     idx = guess_exchange_index(t)
-                cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t)
-                log(
-                    f"ONELEG cancel rest {t} px={order_price_dollars(o):.2f} "
-                    f"live={live_rest} losing_lock={rec.get('lock_if_prints')}"
-                )
+                if cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t):
+                    log(
+                        f"ONELEG cancel rest {t} px={order_price_dollars(o):.2f} "
+                        f"live={live_rest} losing_lock={rec.get('lock_if_prints')}"
+                    )
+                else:
+                    still.append(o)
+                    log(f"ONELEG cancel rest fail {t} oid={order_oid(o)} (leave sitting)")
+            if still:
+                rec["action"] = "ONELEG cancel rest failed"
+                recs.append(rec)
+                leftover_note(state, None, 0, 0, f"ONELEG cancel rest failed {ev}")
+                _oneleg_log(state, rec)
+                continue
             rest_legs = []
         # Other team's buy is gone. Wait 3 minutes after the first order
         # went through before selling the leftover contract. Never a new
@@ -1415,13 +1455,23 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
             and order_remaining_qty(o) > 0
             and order_oid(o)
         ]
+        extra_left = False
         for o in extra_bids:
             t = order_ticker(o)
             idx = cache.get(t)
             if idx is None:
                 idx = guess_exchange_index(t)
-            cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t)
-            log(f"ONELEG cancel extra bid {t} oid={order_oid(o)}")
+            if cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t):
+                log(f"ONELEG cancel extra bid {t} oid={order_oid(o)}")
+            else:
+                extra_left = True
+                log(f"ONELEG cancel extra bid fail {t} oid={order_oid(o)}")
+        if extra_left:
+            rec["action"] = "ONELEG cancel extra bid failed"
+            recs.append(rec)
+            leftover_note(state, None, 0, 0, f"ONELEG cancel extra bid failed {ev}")
+            _oneleg_log(state, rec)
+            continue
         sell_note = None
         if fsigned <= 0:
             sell_note = "ORCH short/NO inventory; no YES sell"
@@ -1897,9 +1947,7 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     state["n_resting"] = len(orders)
     if int(idx) in failed or 3 in failed:
         return f"resting GET miss failed={failed}; not placing"
-    prev_pos = list(state.get("open_positions") or [])
     positions, pos_failed = collect_open_positions(k, sorted({0, 3, int(idx)}))
-    log_position_increases(prev_pos, positions)
     state["open_positions"] = positions
     state["n_open_pos"] = len(positions)
     state["open_pos_tickers"] = sorted({p["ticker"] for p in positions if p.get("ticker")})
@@ -2062,8 +2110,9 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
         oid_a = ra.get("order_id")
         rb = place_yes_post_only(k, tw["b"], tw["yes_b"], qty, idx)
     except UnfundedShard:
-        if oid_a:
-            cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"])
+        if oid_a and not cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"]):
+            log(f"LIVE first buy still up {tw['a']} oid={oid_a} (cancel failed)")
+            return "first buy still up; cancel failed"
         if leftover:
             leftover_note(state, free, qty, notional, "leftover unfunded; sit no transfer")
             log(f"SHARD miss leftover: {tw['a']} idx={idx} cash={cash:g} sit (no transfer)")
@@ -2075,8 +2124,8 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
             return f"unfunded-404 fund failed ({e})"
         return "unfunded-404 retried fund; skip this tick"
     except Exception:
-        if oid_a:
-            cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"])
+        if oid_a and not cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"]):
+            log(f"LIVE first buy still up {tw['a']} oid={oid_a} (cancel failed)")
         raise
     if leftover:
         leftover_note(state, free, qty, notional)

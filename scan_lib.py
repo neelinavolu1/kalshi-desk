@@ -173,7 +173,6 @@ class Kalshi:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 20)
                 continue
-            self.last = time.monotonic()
             if r.status_code == 429:
                 self.n_429 += 1
                 ra = r.headers.get("Retry-After")
@@ -212,7 +211,6 @@ class Kalshi:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 20)
                 continue
-            self.last = time.monotonic()
             if r.status_code == 429:
                 self.n_429 += 1
                 ra = r.headers.get("Retry-After")
@@ -260,7 +258,6 @@ class Kalshi:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 20)
                 continue
-            self.last = time.monotonic()
             if r.status_code == 429:
                 self.n_429 += 1
                 time.sleep(min(backoff, 30))
