@@ -149,6 +149,12 @@ STALE_S = 2.0
 WATCH_N = 20  # 16 dropped live ATP (FEAROD) once pins + MLB ate slots
 UNIVERSE_S = 90.0
 IN_PLAY_MAX_AGE = 18 * 3600  # occ older than this is not in-play (yesterday first-ball)
+# Overnight both-sides buys are one-side bait. Process stays up 24/7 so a
+# leftover sell still works; we only START both-sides buys 6am-11pm ET and
+# only when first ball is within 3 hours (or the match has already started).
+SIT_HOUR_LO = 6   # 6am ET
+SIT_HOUR_HI = 23  # through 11pm ET
+SIT_BEFORE_FIRST_BALL_SEC = 3 * 3600
 SKIP_TICKER_SUBSTR = ("CROSSCATEGORY", "KXMVE", "SHARD1", "SHARD2")
 
 # Same-day sports live on these series; /markets open-list is flooded with MVE shards.
@@ -239,6 +245,38 @@ def ticker_start_et(ticker: str):
         return datetime(2000 + int(yy), _MON[mon], int(dd), hh, mm, tzinfo=ET)
     except ValueError:
         return None
+
+
+def sit_window_reason(tw: dict, *, unknown_ok: bool = False, now=None) -> str | None:
+    """None = ok to sit both-sides buys. Else a short why-wait.
+
+    unknown_ok: when pulling already-sitting buys, do not cancel just because
+    we cannot read first-ball (tennis tickers often have no HHMM). New buys
+    still wait if first-ball is missing.
+    """
+    now = now or datetime.now(ET)
+    if int(now.hour) < SIT_HOUR_LO or int(now.hour) > SIT_HOUR_HI:
+        return "outside 6am-11pm ET desk hours; wait"
+    play_t = tw.get("play_t")
+    if isinstance(play_t, str):
+        play_t = parse_ts(play_t)
+    if play_t is None:
+        play_t = ticker_start_et(tw.get("a") or "")
+    if play_t is None:
+        if tw.get("in_play"):
+            return None
+        if unknown_ok:
+            return None
+        return "no first-ball time; wait"
+    try:
+        if getattr(play_t, "tzinfo", None) is None:
+            play_t = play_t.replace(tzinfo=timezone.utc)
+        delta = (play_t - now).total_seconds()
+    except Exception:
+        return None if unknown_ok else "no first-ball time; wait"
+    if delta > SIT_BEFORE_FIRST_BALL_SEC:
+        return f"first-ball in {delta / 3600.0:.1f}h; wait"
+    return None
 
 
 def to_cents(px, *, dollars: bool | None = None) -> int | None:
@@ -1631,6 +1669,45 @@ def cancel_our_order(
         return False
 
 
+def pull_sits_outside_window(k: Kalshi, state: dict) -> None:
+    """Cancel both-sides buys sitting overnight or too far from first ball.
+
+    Leave a game alone if we already own a contract (leftover sell owns it).
+    Never touch HARLLA.
+    """
+    orders = state.get("resting") or []
+    pos_evs = set(state.get("open_pos_events") or [])
+    tw_by_ev = {}
+    for tw in state.get("two_ways_snap") or []:
+        evn = event_prefix(tw.get("a") or "")
+        if evn:
+            tw_by_ev[evn] = tw
+    cache = state.setdefault("idx_cache", {})
+    for ev in two_way_resting_events(orders):
+        if is_harlla(ev):
+            continue
+        if ev in pos_evs:
+            continue
+        tw = tw_by_ev.get(ev) or resting_pair_quote(orders, ev) or {"a": ev}
+        why = sit_window_reason(tw, unknown_ok=True)
+        if not why:
+            continue
+        legs = [
+            o
+            for o in orders
+            if event_prefix(order_ticker(o)) == ev and order_oid(o)
+        ]
+        n_ok = 0
+        for o in legs:
+            t = order_ticker(o)
+            idx = cache.get(t)
+            if idx is None:
+                idx = guess_exchange_index(t)
+            if cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t):
+                n_ok += 1
+        log(f"LIVE pull overnight sit {ev} {why} cancel {n_ok}/{len(legs)}")
+
+
 def refresh_portfolio(k: Kalshi, watch: list, state: dict, books=None) -> None:
     cache = state.setdefault("idx_cache", {})
     idxs = {0, 3}
@@ -1981,6 +2058,8 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     n_inv_pairs = len(pos_events) if locked else 0
     leftover = n_rest_pairs >= 1 or n_inv_pairs >= 1
     reason = live_filter_reason(tw, leftover=leftover)
+    if reason is None:
+        reason = sit_window_reason(tw)
     if reason:
         if leftover:
             leftover_note(state, None, 0, 0, reason)
@@ -2394,6 +2473,7 @@ def pick_watch(k: Kalshi):
                         "day": day,
                         "title": (m.get("title") or e.get("title") or "")[:80],
                         "close": cl,
+                        "play_t": play_t,
                         "yb": yb,
                         "nb": nb,
                         "in_play": in_play,
@@ -2829,6 +2909,16 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
             if not tw:
                 continue
             tw["in_play"] = any(bool(x.get("in_play")) for x in legs)
+            play_t = None
+            for x in legs:
+                pt = x.get("play_t") or x.get("close")
+                if pt is not None:
+                    play_t = pt
+                    break
+            if hasattr(play_t, "isoformat"):
+                tw["play_t"] = play_t.isoformat()
+            elif play_t:
+                tw["play_t"] = play_t
             two_ways.append(tw)
             key = (tw["rest"], tw["take"], tw["rest_allin"], tw["take_allin"])
             if tw_keys.get(ev) != key:
@@ -2893,6 +2983,12 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
         n_live = int(state.get("n_live_pairs") or len(state.get("live_pair_events") or []))
         leftover_now = n_live >= 1
         state["two_ways_snap"] = two_ways
+        if LIVE_FIRE and (time.monotonic() - float(state.get("sit_pull_ts") or 0)) >= 8.0:
+            state["sit_pull_ts"] = time.monotonic()
+            try:
+                await asyncio.to_thread(pull_sits_outside_window, k, state)
+            except Exception as e:
+                log(f"SIT window pull {safe_err(e)}")
         if LIVE_FIRE and not state.get("live_busy"):
             resting_evs = set(state.get("live_pair_events") or [])
             resting_stems = {game_stem(t) for t in (state.get("resting_tickers") or [])}
