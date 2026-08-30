@@ -441,7 +441,7 @@ class Book:
 
 
 SPORTS_FEE_M = 0.5  # fallback only when series fee_type is not cached yet
-GAME_KEEP = ("KXMLBGAME", "KXWNBAGAME", "KXNFLGAME", "KXT20MATCH")
+GAME_KEEP = ("KXMLBGAME", "KXWNBAGAME", "KXNFLGAME")  # T20 skipped (not a 1-and-0; was crowding tennis/MLB)
 _FEE_CACHE: dict[str, dict] = {}
 _FEE_LOCK = threading.Lock()
 _ONELEG_LOCK = threading.Lock()
@@ -2543,9 +2543,11 @@ def pick_watch(k: Kalshi):
                     continue  # KBO: skip (ties / not a clean 1-and-0)
                 if tu.startswith("KXNPB"):
                     continue  # NPB: ties possible, same as KBO
-                # Live T20 ranks in_play ahead of today MLB and cannot be the
-                # leftover second pair (cricket skip + shard 0, no transfer).
-                if leftover_mode and is_cricket(t):
+                # Live T20 ranks in_play ahead of tennis/MLB and is skipped at
+                # trade time anyway. Leftover-mode-only skip still let T20 eat
+                # 10/20 watch slots (HERVRA/CENSOU/VCCKAM/MEENOI/DUBEDI) and
+                # rotate BOSNYY / VALMON / SAWUDV off the book.
+                if is_cricket(t):
                     continue
                 ex_idx = m.get("exchange_index")
                 if ex_idx is None or str(ex_idx) == "":
@@ -2857,6 +2859,7 @@ def pick_watch(k: Kalshi):
         )
         and not any(
             (leg.get("ticker") or "").upper().startswith("KXNCAAF")
+            or is_cricket(leg.get("ticker") or "")
             for leg in row["legs"]
         )
     ]
@@ -2876,11 +2879,12 @@ def pick_watch(k: Kalshi):
     def _is_ghost_series(row):
         return any(
             (leg.get("ticker") or "").upper().startswith(("KXNCAAF", "KXKBO"))
+            or is_cricket(leg.get("ticker") or "")
             for leg in row["legs"]
         )
     scored_noghost = [row for row in scored if not _is_ghost_series(row)]
     take(scored_noghost, max(0, WATCH_N - 4))
-    keep = GAME_KEEP if not leftover_mode else tuple(x for x in GAME_KEEP if x != "KXT20MATCH")
+    keep = GAME_KEEP
     game_scored = [
         row for row in scored
         if int(row.get("day") if row.get("day") is not None else 9) <= 1
