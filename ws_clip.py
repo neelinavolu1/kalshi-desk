@@ -830,7 +830,7 @@ def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = Tr
         return f"leftover in-play lopsided {float(ba):.2f}/{float(bb):.2f}"
     if float(ba) + float(bb) > LIVE_REST_MAX + 1e-12:
         if leftover:
-            return "idle cash but rest_allin>0.99"
+            return f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
         return f"rest {float(ba)+float(bb):.2f}>{LIVE_REST_MAX}"
     sa, sb = tw.get("spread_a"), tw.get("spread_b")
     # 7-10c books can print bid_sum~93c and are not locks.
@@ -845,9 +845,13 @@ def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = Tr
     ):
         return "fat take-rest gap"
     ra = tw.get("rest_allin")
-    # All live rests: rest_allin <= 0.99 (~1c after M=0.5). 0.99 raw is 1.008 all-in.
+    # All live rests: rest_allin <= LIVE_REST_ALLIN_MAX (0.98). Raw 0.99 is ~1.008 all-in after M=0.5.
     if ra is None or float(ra) > LIVE_REST_ALLIN_MAX + 1e-12:
-        return "idle cash but rest_allin>0.99" if leftover else f"rest_allin {ra}>0.99"
+        return (
+            f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
+            if leftover
+            else f"rest_allin {ra}>{LIVE_REST_ALLIN_MAX:g}"
+        )
     return None
 
 
@@ -2297,12 +2301,13 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
         rest_allin = round(unit + (fy + fn) / qty, 4)
         tw = {**tw, "qty": qty, "rest_allin": rest_allin, "rest_edge": round(1.0 - rest_allin, 4)}
         if rest_allin > LIVE_REST_ALLIN_MAX + 1e-12:
-            leftover_note(state, free, qty, notional, "idle cash but rest_allin>0.99")
+            why_ra = f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
+            leftover_note(state, free, qty, notional, why_ra)
             log(
-                f"LIVE leftover sit {event_prefix(tw['a'])} idle cash but rest_allin>0.99 "
+                f"LIVE leftover sit {event_prefix(tw['a'])} {why_ra} "
                 f"rest_allin={rest_allin} free={free:.2f}"
             )
-            return "idle cash but rest_allin>0.99"
+            return why_ra
         # Idle money only: never transfer to fund a second pair (T20 shard 0 etc).
     else:
         if qty <= 0:
@@ -2671,6 +2676,15 @@ def pick_watch(k: Kalshi):
         # crowding ATP/MLB off the 20-slot watch (METOWS/LAFGTWN/UVAWPRE).
         series_rank = min(int(x.get("series_rank") or 1) for x in use)
         day = min(int(x.get("day") if x.get("day") is not None else 9) for x in use)
+        # Sit-window for watch rank. Aug31 MLB at 97c was "actionable" 37h out
+        # and ate 8/20 slots while near Challenger (BERNAP/SEYKRU) rotated off.
+        sit_leg = (pair[0] if pair else use[0]) if use else {}
+        sit_tw = {
+            "a": sit_leg.get("ticker") or "",
+            "play_t": sit_leg.get("play_t"),
+            "in_play": in_play,
+        }
+        sit_ok = sit_window_reason(sit_tw) is None if pair else False
         # Skip unpinned pairs we will not sit anyway. Used to require
         # in_play, so pregame (or first-ball clock still in the future)
         # CHI/TEN 15/83 and TOR/PHX 78c still filled leftover GAME slots
@@ -2695,10 +2709,12 @@ def pick_watch(k: Kalshi):
                 "rest_allin_est": rest_allin_est,
                 "day": day,
                 "actionable": actionable,
+                "sit_ok": sit_ok,
                 "skip_unpinned": skip_unpinned,
                 "rank": (
                     0 if pair else 1,  # 2-way GAME/MATCH before live props
-                    0 if actionable else 1,
+                    0 if (actionable and sit_ok) else 1,  # sit-able tight before far MLB
+                    0 if sit_ok else 1,  # first-ball within 3h (or live) before 37h waits
                     0 if in_play else 1,
                     max(day, 0),  # today (0) before Sep NFL (3)
                     series_rank,  # MLB/NFL/ATP/WTA=0 before NCAAF=2
@@ -2843,6 +2859,7 @@ def pick_watch(k: Kalshi):
     # Same-day first so Sep-20 94c NFL does not crowd out today 98c BOSNYY.
     tight.sort(
         key=lambda x: (
+            0 if x.get("sit_ok") else 1,  # within 3h first-ball before Aug31 leftovers
             0 if int(x.get("day") if x.get("day") is not None else 9) <= 1 else 1,
             x["yb_sum"] if x["yb_sum"] is not None else 9.0,
             x["rank"],
@@ -3140,15 +3157,18 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     and game_stem(a) not in resting_stems
                 )
                 mlb = a.upper().startswith("KXMLB")
+                sit_ok = sit_window_reason(t) is None
                 try:
                     ra = float(t.get("rest_allin"))
                 except (TypeError, ValueError):
                     ra = 9.0
                 edge = t.get("rest_edge") if t.get("rest_edge") is not None else -99
                 if leftover_now:
-                    # Independent events first; today/tomorrow MLB 97c over 98c tennis +0.2c.
-                    # Pregame leftover before in-play flap (CINCHC 97c dumped BOSNYYG2).
+                    # Sit-window first: Aug31 MLB 97c was burning the one live
+                    # attempt/tick on "first-ball in 38h" while near Challenger
+                    # never got tried. Then independent; today MLB over tennis.
                     return (
+                        0 if sit_ok else 1,
                         0 if independent else 1,
                         0 if mlb else 1,
                         0 if not t.get("in_play") else 1,
@@ -3156,6 +3176,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                         -edge,
                     )
                 return (
+                    0 if sit_ok else 1,
                     0 if t.get("in_play") else 1,
                     0 if mlb else 1,
                     ra,
@@ -3180,6 +3201,20 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                         skip_log[key] = now
                         tag = "leftover sit" if leftover_now else "skip"
                         log(f"LIVE {tag} {evn} {why} rest_allin={tw.get('rest_allin')}")
+                    continue
+                # Do not burn the one live attempt/tick on a 37h first-ball wait.
+                win = sit_window_reason(tw)
+                if win:
+                    evn = event_prefix(tw["a"])
+                    key = f"{evn}|sit-window"
+                    now = time.monotonic()
+                    unused = evn not in resting_evs and game_stem(tw["a"]) not in resting_stems
+                    if unused and sit_why is None:
+                        sit_why = f"{evn}: {win}"
+                    if now - skip_log.get(key, 0) > 60:
+                        skip_log[key] = now
+                        tag = "leftover sit" if leftover_now else "skip"
+                        log(f"LIVE {tag} {evn} {win} rest_allin={tw.get('rest_allin')}")
                     continue
                 evn = event_prefix(tw["a"])
                 # Leftover only: skip a 2-way whose shard has too little free
