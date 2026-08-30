@@ -44,14 +44,14 @@ Never print keys or PEM.
 # Strategy in plain English (for someone new to these markets):
 # Each sports game is two YES contracts -- one per team. Exactly one team
 # wins, so that YES pays $1 and the other pays $0.
-# We sit a buy order on both teams at once, cheap enough that the two
-# prices add to 99 cents or less. If both orders go through we own the $10 card:
-# one side will be worth $1 per contract no matter who wins. Hold that pair.
-# If only one order went through: keep the other buy if it is still sitting
-# and the two prices still add to $1.00 or less (ignore a 2-cent market move).
-# If the other buy is gone, wait 3 minutes after the first side went through
-# before selling the leftover contract. Never sit a new buy on the missing
-# team. Never pay $1.01 or more to complete the pair.
+# We buy both teams at once, cheap enough that the two prices add to 98
+# cents or less. Both sides must go through now -- not later. If both go
+# through we own the card (one side pays $1 no matter who wins). Hold that.
+# If both sides are not through 20 seconds after we placed, cancel what is
+# still sitting and sell any leftover as close to cost as the book allows
+# (1 cent under if we can; never 5-7% down). Never leave a buy sitting more
+# than 5 minutes hoping it goes through later. Never sit a new buy on the
+# missing team. Never pay $1.01 or more to complete the pair.
 from __future__ import annotations
 
 import asyncio
@@ -102,10 +102,11 @@ HEARTBEAT = DIR / "mm_heartbeat"
 BAN_PATH = DIR / "oneleg_ban.json"
 FILLS_LOG = DIR / "fills.jsonl"
 
-LIVE_FIRE = True  # leftover sells still live; new both-sides SITS are off
-# Sitting one team then the other is not arb. Pal/Nam and Cha/Kum one-sided.
-# Only enter later if BOTH asks add to <= 98c at the same moment (not built yet).
-SIT_NEW_PAIRS = False
+LIVE_FIRE = True  # live both-sides buys; never lift ~101c
+# Both sides must go through now. Pal/Nam and Cha/Kum one-sided sits are banned.
+SIT_NEW_PAIRS = True
+PAIR_FILL_WAIT_S = 20.0  # both legs must print within 20s of placing
+MAX_BUY_AGE_S = 300.0  # never leave a buy sitting for later (>5 min)
 CAP_C = 30
 CAP_NOTIONAL = 30.0
 CLIP_NOTIONAL = 30.0  # first pair: skip live rest if dest shard cash below this; fund ~$36
@@ -118,8 +119,8 @@ MAX_STACKED_PAIRS = 3  # alias: max concurrent post-only 2-way rests
 # owning only one side instead of both.
 LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
 LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
-LIVE_REST_MAX = 0.99  # raw yes+yes cap
-LIVE_REST_ALLIN_MAX = 0.99  # leftover second pair: >=~1c after sitting-buy fees
+LIVE_REST_MAX = 0.98  # both sides under 98c at the same moment
+LIVE_REST_ALLIN_MAX = 0.98  # same 98c cap after sitting-buy fees
 LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93c
 # Raw take-rest gap. BROLOF 08:07 ET: 95c rest / 101c take (+3.2c all-in) one-legged in 20s.
 LIVE_TAKE_REST_GAP_MAX = 0.04
@@ -142,7 +143,7 @@ ONELEG_GIVEUP_UNDER = 0.02  # unused while give-up IOC is off
 MAX_LEFTOVER_LOSS_C = 0.02  # never sell more than 2¢ under what we paid
 MAX_LEFTOVER_LOSS_PCT = 0.03  # never sell more than 3% under what we paid
 ONELEG_NEAR_C = 0.01  # existing leftover sell counts as at/near target
-ONELEG_ORPHAN_WAIT_S = 180.0  # true leftover: wait before sitting sell
+ONELEG_ORPHAN_WAIT_S = 20.0  # leftover: 20s after place, then sell near cost
 # Already LIVE on book — do not duplicate, do not cancel.
 KNOWN_LIVE = (
     ("KXATPMATCH-26AUG27HARLLA-HAR", "01a044d3-b7e8-7c4c-a7fc-a328d4559e62"),
@@ -927,6 +928,65 @@ def two_way_resting_events(orders) -> list[str]:
     return [ev for ev, ts in by_ev.items() if len(ts) >= 2]
 
 
+def order_created_epoch(o: dict) -> float | None:
+    raw = o.get("created_time") or o.get("created_ts") or o.get("ts")
+    if raw is None:
+        return None
+    dt = parse_ts(raw) if not isinstance(raw, (int, float)) else None
+    if dt is None and isinstance(raw, (int, float)):
+        v = float(raw)
+        if v > 1e12:
+            v = v / 1000.0
+        return v
+    if dt is None:
+        return None
+    try:
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def event_is_locked(positions, ev: str) -> bool:
+    sizes = []
+    for p in positions or []:
+        t = p.get("ticker") or ""
+        if event_prefix(t) != ev:
+            continue
+        try:
+            pv = abs(float(p.get("position") or 0))
+        except (TypeError, ValueError):
+            continue
+        if pv <= 1e-9:
+            continue
+        sizes.append(pv)
+    return len(sizes) == 2 and abs(sizes[0] - sizes[1]) <= 1e-6
+
+
+def event_buy_age_s(orders, ev: str, state: dict, now_wall: float | None = None) -> float | None:
+    """Seconds since we placed this both-sides buy. None if unknown."""
+    now_wall = time.time() if now_wall is None else float(now_wall)
+    ages = []
+    wall = (state.get("pair_placed_wall") or {}).get(ev)
+    if wall:
+        try:
+            ages.append(now_wall - float(wall))
+        except (TypeError, ValueError):
+            pass
+    for o in orders or []:
+        if event_prefix(order_ticker(o)) != ev:
+            continue
+        if not order_is_yes_bid(o):
+            continue
+        ep = order_created_epoch(o)
+        if ep is not None:
+            ages.append(now_wall - ep)
+    if not ages:
+        return None
+    return max(0.0, min(ages))
+
+
 def list_open_positions(k: Kalshi, exchange_index: int):
     """Unsettled market positions on one shard. None => lookup failed."""
     try:
@@ -1385,8 +1445,11 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
         # Other team's buy is still sitting, and the two prices add to 99 cents
         # or less: keep it. Ignore a 2-cent market move -- that sitting buy can
         # still go through. Never a new buy on the missing team.
+        pair_age = event_buy_age_s(orders, ev, state)
+        timed_out = pair_age is not None and pair_age >= PAIR_FILL_WAIT_S
         keep_rest = (
             bool(rest_legs)
+            and not timed_out
             and (lock_if_prints is None or lock_if_prints <= 0.99 + 1e-12)
         )
         if keep_rest:
@@ -1410,7 +1473,12 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
         # Other buy still sitting and prices add to $1.00 or less: keep it
         # (fees can eat the last penny). Do not sell the leftover. Do not
         # sit a new buy on the missing team.
-        if rest_legs and lock_if_prints is not None and lock_if_prints <= 1.00 + 1e-12:
+        if (
+            rest_legs
+            and not timed_out
+            and lock_if_prints is not None
+            and lock_if_prints <= 1.00 + 1e-12
+        ):
             seen_map.pop(ev, None)
             rec["action"] = "ONELEG wait paired rest"
             recs.append(rec)
@@ -1455,9 +1523,9 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
                 _oneleg_log(state, rec)
                 continue
             rest_legs = []
-        # Other team's buy is gone. Wait 3 minutes after the first order
-        # went through before selling the leftover contract. Never a new
-        # buy on the missing team. Never pay $1.01+ to complete.
+        # Other team's buy is gone. Wait 20 seconds after we placed before
+        # selling the leftover. Never a new buy on the missing team.
+        # Never pay $1.01+ to complete.
         seen = float(seen_map.get(ev) or 0.0)
         if seen > now + 1.0:
             seen = 0.0
@@ -1465,8 +1533,8 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
             seen_map[ev] = now
             seen = now
         orphan_wait = now - seen
-        if orphan_wait < ONELEG_ORPHAN_WAIT_S:
-            rec["action"] = "ONELEG wait other side 180s"
+        if (not timed_out) and orphan_wait < ONELEG_ORPHAN_WAIT_S:
+            rec["action"] = "ONELEG wait other side 20s"
             recs.append(rec)
             leftover_note(
                 state,
@@ -1474,7 +1542,7 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
                 0,
                 0,
                 (
-                    f"ONELEG wait other side 180s {ev} filled={ft} "
+                    f"ONELEG wait other side 20s {ev} filled={ft} "
                     f"{fqty}@{rec.get('filled_px')} waited={orphan_wait:.0f}s"
                 ),
             )
@@ -1484,9 +1552,9 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
         cache = state.setdefault("idx_cache", {})
         state.setdefault("oneleg_ban", set()).add(ev)
         save_oneleg_ban(state["oneleg_ban"])
-        # 3 minutes are up and the other buy is gone: sell the leftover
-        # contract we already own. Never a new buy on the missing team.
-        # Never pay $1.01+ to complete.
+        # 20 seconds are up and both sides did not go through: sell the
+        # leftover as close to cost as the book allows. Never a new buy
+        # on the missing team. Never pay $1.01+ to complete.
         for o in rest_legs:
             t = order_ticker(o)
             idx = cache.get(t)
@@ -1692,6 +1760,47 @@ def cancel_our_order(
         return False
 
 
+def pull_unfilled_after_timeout(k: Kalshi, state: dict) -> None:
+    """Both sides must go through in 20s. No buy may sit more than 5 min.
+
+    Completed both-sides inventory is kept. Leftover sells are not buys.
+    Never touch HARLLA.
+    """
+    orders = state.get("resting") or []
+    positions = state.get("open_positions") or []
+    cache = state.setdefault("idx_cache", {})
+    now_wall = time.time()
+    buys_by_ev: dict[str, list] = {}
+    for o in orders:
+        if not order_is_yes_bid(o):
+            continue
+        if not order_oid(o) or order_remaining_qty(o) <= 0:
+            continue
+        ev = event_prefix(order_ticker(o))
+        if not ev or is_harlla(ev):
+            continue
+        buys_by_ev.setdefault(ev, []).append(o)
+    for ev, legs in buys_by_ev.items():
+        if event_is_locked(positions, ev):
+            continue
+        age = event_buy_age_s(legs, ev, state, now_wall)
+        if age is None:
+            continue
+        if age < PAIR_FILL_WAIT_S and age < MAX_BUY_AGE_S:
+            continue
+        why = "5min" if age >= MAX_BUY_AGE_S else "20s"
+        n_ok = 0
+        for o in legs:
+            t = order_ticker(o)
+            idx = cache.get(t)
+            if idx is None:
+                idx = guess_exchange_index(t)
+            if cancel_our_order(k, order_oid(o), exchange_index=idx, market_ticker=t):
+                n_ok += 1
+        log(f"LIVE pull unfilled {why} {ev} age={age:.0f}s cancel {n_ok}/{len(legs)}")
+        (state.get("pair_placed_wall") or {}).pop(ev, None)
+
+
 def pull_sits_outside_window(k: Kalshi, state: dict) -> None:
     """Cancel both-sides buys sitting overnight or too far from first ball.
 
@@ -1783,6 +1892,10 @@ def refresh_portfolio(k: Kalshi, watch: list, state: dict, books=None) -> None:
     state["pos_failed_shards"] = pos_failed
     state["port_ts"] = time.monotonic()
     if LIVE_FIRE:
+        try:
+            pull_unfilled_after_timeout(k, state)
+        except Exception as e:
+            log(f"UNFILLED pull {safe_err(e)}")
         try:
             handle_oneleg_inventory(k, state, books)
         except Exception as e:
@@ -2234,6 +2347,7 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     if leftover:
         leftover_note(state, free, qty, notional)
         state["leftover_sit_reason"] = None
+    state.setdefault("pair_placed_wall", {})[event_prefix(tw["a"])] = time.time()
     log(
         f"LIVE REST {tw['a']} {qty}@{tw['yes_a']:.2f} + {tw['b']} {qty}@{tw['yes_b']:.2f} "
         f"idx={idx} post_only=1 leftover={int(leftover)} notional={notional:.2f} "
@@ -2901,7 +3015,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
         for w in watch:
             if isinstance(w, dict) and w.get("ticker") and w.get("exchange_index") is not None:
                 cache[w["ticker"]] = int(w["exchange_index"])
-        if LIVE_FIRE and (time.monotonic() - float(state.get("port_ts") or 0)) >= 8.0:
+        if LIVE_FIRE and (time.monotonic() - float(state.get("port_ts") or 0)) >= 2.0:
             try:
                 await asyncio.to_thread(refresh_portfolio, k, watch, state, books)
             except Exception as e:
@@ -3008,10 +3122,11 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
         n_live = int(state.get("n_live_pairs") or len(state.get("live_pair_events") or []))
         leftover_now = n_live >= 1
         state["two_ways_snap"] = two_ways
-        if LIVE_FIRE and (time.monotonic() - float(state.get("sit_pull_ts") or 0)) >= 8.0:
+        if LIVE_FIRE and (time.monotonic() - float(state.get("sit_pull_ts") or 0)) >= 2.0:
             state["sit_pull_ts"] = time.monotonic()
             try:
                 await asyncio.to_thread(pull_sits_outside_window, k, state)
+                await asyncio.to_thread(pull_unfilled_after_timeout, k, state)
             except Exception as e:
                 log(f"SIT window pull {safe_err(e)}")
         if LIVE_FIRE and not state.get("live_busy"):
