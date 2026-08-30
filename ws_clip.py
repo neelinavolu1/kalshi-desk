@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kalshi WS clipper. LIVE_FIRE post_only 2-way YES rests only.
+"""Kalshi WS clipper. LIVE_FIRE both-sides YES buys only when both asks lock under $1 after fees.
 
 Shard lesson (do not drop): Kalshi is sharded. Tennis+baseball = exchange_index=3
 as of 2026-08-24 (combos=1, crypto=2, else 0). GET /markets/{ticker} has the index.
@@ -44,13 +44,15 @@ Never print keys or PEM.
 # Strategy in plain English (for someone new to these markets):
 # Each sports game is two YES contracts -- one per team. Exactly one team
 # wins, so that YES pays $1 and the other pays $0.
-# We buy both teams at once, cheap enough that the two prices add to 98
-# cents or less. Both sides must go through now -- not later. If both go
-# through we own the card (one side pays $1 no matter who wins). Hold that.
+# We buy both teams at the same moment, only when both YES asks are on the
+# book right now and after taker fees the pair is still under $1. If that
+# lock is not on the book, cash sits. We do not leave a buy sitting hoping
+# the other side shows up later.
+# If both sides go through we own the card (one side pays $1 no matter who
+# wins). Hold that.
 # If both sides are not through 20 seconds after we placed, cancel what is
 # still sitting and sell any leftover as close to cost as the book allows
-# (1 cent under if we can; never 5-7% down). Never leave a buy sitting more
-# than 5 minutes hoping it goes through later. Never sit a new buy on the
+# (1 cent under if we can; never 5-7% down). Never sit a new buy on the
 # missing team. Never pay $1.01 or more to complete the pair.
 from __future__ import annotations
 
@@ -103,8 +105,8 @@ BAN_PATH = DIR / "oneleg_ban.json"
 FILLS_LOG = DIR / "fills.jsonl"
 
 LIVE_FIRE = True  # live both-sides buys; never lift ~101c
-# Both sides must go through now. Pal/Nam and Cha/Kum one-sided sits are banned.
-SIT_NEW_PAIRS = True
+# Both sides must go through now, at the live asks, when the after-fee pair is under $1.
+SIT_NEW_PAIRS = True  # allow new both-sides takes (not sitting buys)
 PAIR_FILL_WAIT_S = 20.0  # both legs must print within 20s of placing
 MAX_BUY_AGE_S = 300.0  # never leave a buy sitting for later (>5 min)
 CAP_C = 30
@@ -119,8 +121,9 @@ MAX_STACKED_PAIRS = 3  # alias: max concurrent post-only 2-way rests
 # owning only one side instead of both.
 LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
 LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
-LIVE_REST_MAX = 0.97  # skip 98c+; 97c is the last sit (Collignon/Fery 98c one-legged 8:08 ET)
-LIVE_REST_ALLIN_MAX = 0.98  # same 98c cap after sitting-buy fees
+LIVE_REST_MAX = 0.97  # leftover sitting-buy rotate only; new buys do not sit at 97c
+LIVE_REST_ALLIN_MAX = 0.98  # leftover sitting-buy rotate only
+LIVE_TAKE_ALLIN_MAX = 0.99  # new both-sides buys: strictly under $1 after taker fees; skip 1.00 and 101c
 LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93c
 # Raw take-rest gap. BROLOF 08:07 ET: 95c rest / 101c take (+3.2c all-in) one-legged in 20s.
 LIVE_TAKE_REST_GAP_MAX = 0.04
@@ -431,6 +434,8 @@ class Book:
             "no_ask": no_ask,
             "yes_bid_q": yq,
             "no_bid_q": nq,
+            "yes_ask_q": nq,  # size at the YES ask (same as the NO bid size)
+            "yes_ask_depth": nq,
             "spread": spread,
             "stale_s": round(stale, 3),
             "n_yes_lv": len(self.yes),
@@ -751,6 +756,8 @@ def two_way_paper(qa: dict, qb: dict):
         "spread_b": qb.get("spread"),
         "yes_bid_q_a": qa.get("yes_bid_q"),
         "yes_bid_q_b": qb.get("yes_bid_q"),
+        "yes_ask_q_a": qa.get("yes_ask_q") or qa.get("yes_ask_depth") or qa.get("no_bid_q"),
+        "yes_ask_q_b": qb.get("yes_ask_q") or qb.get("yes_ask_depth") or qb.get("no_bid_q"),
         "paper": True,
         "live_fire": bool(LIVE_FIRE),
     }
@@ -789,19 +796,18 @@ def is_lopsided_pair(ya, yb) -> bool:
     return abs(a - b) > LEFTOVER_INPLAY_BID_GAP + 1e-12
 
 
-# Should we sit buy orders on both teams of this game?
-# Returns None if the prices look fair enough to try. Otherwise a short
-# reason to skip: a team outside 35-65 cents, one team a huge favorite, the two
-# prices adding up over 99 cents, or the bid/ask gap too wide.
+# Should we buy both teams of this game right now?
+# Returns None if the asks look like a real after-fee lock. Otherwise a short
+# reason to skip: a team outside 35-65 cents, one team a huge favorite, an
+# ask missing, or the pair over 99 cents after taker fees.
 def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = True) -> str | None:
-    """None => book filters pass for a live post_only 2-way rest.
+    """None => book looks OK.
 
-    placement=True (maybe_live_rest / new candidates, and OUR resting quote
-    in release_stale_leftover_rest): LIVE_BID 35-65 and is_lopsided_pair on
-    every 2-way, pregame included.
-    placement=False (touch-based leftover rotate): do not cancel solely because
-    the touch walked off band; rest_allin>0.99 and leftover in-play lopsided
-    still rotate. OUR posted prices are checked with placement=True separately.
+    leftover=True: leftover sitting-buy rotate still uses the old bid/sum
+    checks (only if a leftover buy is still sitting).
+    leftover=False: new both-sides buys. Both YES asks must be live, wings
+    35-65 on those asks, and after taker fees the pair is under $1.
+    Wide spread is fine when both asks exist; skip only if an ask is missing.
     """
     a, b = tw.get("a") or "", tw.get("b") or ""
     if is_harlla(a) or is_harlla(b):
@@ -812,61 +818,90 @@ def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = Tr
         return "skip NPB"
     if is_cricket(a) or is_cricket(b):
         return "cricket skip"
-    ba, bb = tw.get("yes_a"), tw.get("yes_b")
-    if ba is None or bb is None:
-        return "missing bids"
-    if placement:
-        if not (LIVE_BID_LO - 1e-12 <= float(ba) <= LIVE_BID_HI + 1e-12):
-            return f"wing a={ba:.2f}"
-        if not (LIVE_BID_LO - 1e-12 <= float(bb) <= LIVE_BID_HI + 1e-12):
-            return f"wing b={bb:.2f}"
-        # All 2-way live rests (first pair and leftover, pregame too).
-        # 25/70 and 70/25 must not stack. Gap LEFTOVER_INPLAY_BID_GAP (0.35).
-        if is_lopsided_pair(ba, bb):
-            tag = "leftover " if leftover else ""
-            return f"{tag}lopsided {float(ba):.2f}/{float(bb):.2f}"
-    elif leftover and tw.get("in_play") and is_lopsided_pair(ba, bb):
-        # Keep-working: leftover in-play 25-75 / gap 35 still rotates CWS/MIN.
-        return f"leftover in-play lopsided {float(ba):.2f}/{float(bb):.2f}"
-    if float(ba) + float(bb) > LIVE_REST_MAX + 1e-12:
-        if leftover:
+
+    if leftover:
+        ba, bb = tw.get("yes_a"), tw.get("yes_b")
+        if ba is None or bb is None:
+            return "missing bids"
+        if placement:
+            if not (LIVE_BID_LO - 1e-12 <= float(ba) <= LIVE_BID_HI + 1e-12):
+                return f"wing a={ba:.2f}"
+            if not (LIVE_BID_LO - 1e-12 <= float(bb) <= LIVE_BID_HI + 1e-12):
+                return f"wing b={bb:.2f}"
+            if is_lopsided_pair(ba, bb):
+                return f"leftover lopsided {float(ba):.2f}/{float(bb):.2f}"
+        elif tw.get("in_play") and is_lopsided_pair(ba, bb):
+            return f"leftover in-play lopsided {float(ba):.2f}/{float(bb):.2f}"
+        if float(ba) + float(bb) > LIVE_REST_MAX + 1e-12:
             return f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
-        return f"rest {float(ba)+float(bb):.2f}>{LIVE_REST_MAX}"
-    sa, sb = tw.get("spread_a"), tw.get("spread_b")
-    # 7-10c books can print bid_sum~93c and are not locks.
-    if sa is None or sb is None or float(sa) > LIVE_SPREAD_MAX + 1e-12 or float(sb) > LIVE_SPREAD_MAX + 1e-12:
-        return "wide spread"
-    tr, ta = tw.get("rest"), tw.get("take")
-    # Fat take-rest = adverse-selection magnet (challenger upgrade one-legs).
-    if (
-        tr is not None
-        and ta is not None
-        and float(ta) - float(tr) > LIVE_TAKE_REST_GAP_MAX + 1e-12
-    ):
-        return "fat take-rest gap"
-    ra = tw.get("rest_allin")
-    # All live rests: rest_allin <= LIVE_REST_ALLIN_MAX (0.98). Raw 97c ATP can be ~0.979 after fees; raw 98c is blocked by LIVE_REST_MAX.
-    if ra is None or float(ra) > LIVE_REST_ALLIN_MAX + 1e-12:
-        return (
-            f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
-            if leftover
-            else f"rest_allin {ra}>{LIVE_REST_ALLIN_MAX:g}"
-        )
+        sa, sb = tw.get("spread_a"), tw.get("spread_b")
+        if sa is None or sb is None or float(sa) > LIVE_SPREAD_MAX + 1e-12 or float(sb) > LIVE_SPREAD_MAX + 1e-12:
+            return "wide spread"
+        tr, ta = tw.get("rest"), tw.get("take")
+        if (
+            tr is not None
+            and ta is not None
+            and float(ta) - float(tr) > LIVE_TAKE_REST_GAP_MAX + 1e-12
+        ):
+            return "fat take-rest gap"
+        ra = tw.get("rest_allin")
+        if ra is None or float(ra) > LIVE_REST_ALLIN_MAX + 1e-12:
+            return f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
+        return None
+
+    # New both-sides buy: band uses asks if present, else bids.
+    aa, ab = tw.get("ask_a"), tw.get("ask_b")
+    ba, bb = tw.get("yes_a"), tw.get("yes_b")
+    pa, pb = (aa, ab) if (aa is not None and ab is not None) else (ba, bb)
+    if pa is None or pb is None:
+        return "missing asks"
+    if placement:
+        if not (LIVE_BID_LO - 1e-12 <= float(pa) <= LIVE_BID_HI + 1e-12):
+            return f"wing a={float(pa):.2f}"
+        if not (LIVE_BID_LO - 1e-12 <= float(pb) <= LIVE_BID_HI + 1e-12):
+            return f"wing b={float(pb):.2f}"
+        if is_lopsided_pair(pa, pb):
+            return f"lopsided {float(pa):.2f}/{float(pb):.2f}"
+    if aa is None or ab is None:
+        return "missing asks"
+    if tw.get("take") is None:
+        return "missing asks"
+    ta = tw.get("take_allin")
+    if ta is None or float(ta) > LIVE_TAKE_ALLIN_MAX + 1e-12:
+        return f"take_allin {ta}>{LIVE_TAKE_ALLIN_MAX:g}"
     return None
 
 
-def live_qty(qa: dict, qb: dict, cash: float | None = None, yes_a=None, yes_b=None) -> int:
-    """qty = min(CAP_C, floor(min yes_bid_q), floor(shard_cash / (yes_a+yes_b)))."""
-    try:
-        da = float(qa.get("yes_bid_q") or 0)
-        db = float(qb.get("yes_bid_q") or 0)
-        depth = int(min(da, db))  # floor for positive
-    except (TypeError, ValueError):
-        depth = 0
+def live_qty(qa: dict, qb: dict, cash: float | None = None, yes_a=None, yes_b=None, *, use_ask: bool = False) -> int:
+    """qty = min(CAP_C, floor of both depths, floor(cash / unit)).
+
+    use_ask=True: size from YES ask depth (for both-sides takes).
+    use_ask=False: size from YES bid depth (leftover sitting-buy rotate only).
+    """
+    if use_ask:
+        def _ask_q(q):
+            return q.get("yes_ask_q") or q.get("yes_ask_depth") or q.get("no_bid_q") or 0
+        try:
+            da = float(_ask_q(qa))
+            db = float(_ask_q(qb))
+            depth = int(min(da, db))
+        except (TypeError, ValueError):
+            depth = 0
+    else:
+        try:
+            da = float(qa.get("yes_bid_q") or 0)
+            db = float(qb.get("yes_bid_q") or 0)
+            depth = int(min(da, db))
+        except (TypeError, ValueError):
+            depth = 0
     qty = max(0, min(CAP_C, depth))
     try:
-        ya = float(yes_a if yes_a is not None else qa.get("yes_bid") or 0)
-        yb = float(yes_b if yes_b is not None else qb.get("yes_bid") or 0)
+        if use_ask:
+            ya = float(yes_a if yes_a is not None else qa.get("yes_ask") or 0)
+            yb = float(yes_b if yes_b is not None else qb.get("yes_ask") or 0)
+        else:
+            ya = float(yes_a if yes_a is not None else qa.get("yes_bid") or 0)
+            yb = float(yes_b if yes_b is not None else qb.get("yes_bid") or 0)
     except (TypeError, ValueError):
         ya, yb = 0.0, 0.0
     unit = ya + yb
@@ -1102,6 +1137,38 @@ def place_yes_post_only(k: Kalshi, ticker: str, price: float, count: int, exchan
         "exchange_index": int(exchange_index),
     }
     return k.post("/portfolio/events/orders", body)
+
+
+# Buy YES right now at the live ask. immediate_or_cancel: take what is
+# there and do not leave a leftover buy sitting. Never buy at $1.00 or more.
+def place_yes_ioc_buy(k: Kalshi, ticker: str, price: float, count: int, exchange_index: int) -> dict:
+    if float(price) >= 1.0 - 1e-12 or float(price) <= 0:
+        raise RuntimeError("refuse buy px outside (0, 1.00) (no 101c)")
+    body = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": "bid",  # buy YES
+        "count": f"{int(count):.2f}",
+        "price": f"{float(price):.4f}",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "subaccount": 0,
+        "exchange_index": int(exchange_index),
+    }
+    return k.post("/portfolio/events/orders", body)
+
+
+def _resp_order_id(resp) -> str | None:
+    if not isinstance(resp, dict):
+        return None
+    oid = resp.get("order_id")
+    if oid:
+        return str(oid)
+    inner = resp.get("order")
+    if isinstance(inner, dict) and inner.get("order_id"):
+        return str(inner.get("order_id"))
+    return None
 
 
 # Place a sell order for a leftover YES contract we already own, and leave
@@ -2147,12 +2214,13 @@ def leftover_note(state: dict, cash, qty, notional, reason: str | None = None) -
         state["leftover_sit_reason"] = reason
 
 
-# Try to sit buy orders on both teams of this game (wait on both sides).
-# If we already own a leftover contract on one team of this same game,
-# handle that instead -- never sit a new buy on the missing team.
+# Try to buy both teams of this game at the live asks, same moment.
+# Only if both asks are on the book now and after taker fees the pair is
+# under $1. If we already own a leftover contract on one team of this same
+# game, handle that instead -- never sit a new buy on the missing team.
 def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str:
     if not SIT_NEW_PAIRS:
-        return "no sit; both sides must be under 98c at once"
+        return "no new both-sides takes; waiting on both asks under $1 after fees"
     if event_prefix(tw["a"]) in (state.get("oneleg_ban") or set()):
         return "oneleg ban — already flattened, do not re-buy"
     cache = state.setdefault("idx_cache", {})
@@ -2199,7 +2267,9 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     # treat as a first-pair fund ($12 from shard 0) or we LIVE-fail spam.
     n_inv_pairs = len(pos_events) if locked else 0
     leftover = n_rest_pairs >= 1 or n_inv_pairs >= 1
-    reason = live_filter_reason(tw, leftover=leftover)
+    # New both-sides buys always use the take gate (both asks + after-fee
+    # under $1), even when leftover cash could size a second pair.
+    reason = live_filter_reason(tw, leftover=False)
     if reason is None:
         reason = sit_window_reason(tw)
     if reason:
@@ -2279,12 +2349,28 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     elif n_rest_pairs >= n_allowed:
         return f"cap: n_live_pairs={n_rest_pairs} cap={n_allowed} resting={pairs[:3]}"
     size_cash = free if leftover else cash
-    qty = live_qty(qa, qb, cash=size_cash, yes_a=tw.get("yes_a"), yes_b=tw.get("yes_b"))
+    aa, ab = tw.get("ask_a"), tw.get("ask_b")
+    if aa is None or ab is None:
+        return "missing asks"
     try:
-        unit = float(tw["yes_a"]) + float(tw["yes_b"])
+        if float(aa) >= 1.0 - 1e-12 or float(ab) >= 1.0 - 1e-12 or float(aa) <= 0 or float(ab) <= 0:
+            return "ask outside (0, 1.00); no 101c"
+    except (TypeError, ValueError):
+        return "missing asks"
+    qty = live_qty(
+        qa, qb, cash=size_cash, yes_a=aa, yes_b=ab, use_ask=True
+    )
+    try:
+        unit = float(aa) + float(ab)
     except (TypeError, ValueError, KeyError):
         unit = 0.0
     notional = qty * unit if qty and unit else 0.0
+
+    def _take_allin_at(n):
+        fy = take_leg_fee(n, float(aa), tw["a"])
+        fn = take_leg_fee(n, float(ab), tw["b"])
+        return round(unit + (fy + fn) / n, 4)
+
     if leftover:
         leftover_note(state, free, qty, notional)
         if qty <= 0 or notional + 1e-12 < MIN_LEFTOVER_NOTIONAL:
@@ -2295,19 +2381,17 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
                 f"n_live_pairs={n_rest_pairs} cap={n_allowed}"
             )
             return msg
-        # Recompute all-in at the actual leftover size (small qty can worsen unit fee).
-        fy = rest_leg_fee(qty, float(tw["yes_a"]), tw["a"])
-        fn = rest_leg_fee(qty, float(tw["yes_b"]), tw["b"])
-        rest_allin = round(unit + (fy + fn) / qty, 4)
-        tw = {**tw, "qty": qty, "rest_allin": rest_allin, "rest_edge": round(1.0 - rest_allin, 4)}
-        if rest_allin > LIVE_REST_ALLIN_MAX + 1e-12:
-            why_ra = f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
-            leftover_note(state, free, qty, notional, why_ra)
+        # Recompute after-fee cost at the actual leftover size (small qty can worsen unit fee).
+        take_allin = _take_allin_at(qty)
+        tw = {**tw, "qty": qty, "take_allin": take_allin, "take_edge": round(1.0 - take_allin, 4)}
+        if take_allin > LIVE_TAKE_ALLIN_MAX + 1e-12:
+            why_ta = f"idle cash but take_allin>{LIVE_TAKE_ALLIN_MAX:g}"
+            leftover_note(state, free, qty, notional, why_ta)
             log(
-                f"LIVE leftover sit {event_prefix(tw['a'])} {why_ra} "
-                f"rest_allin={rest_allin} free={free:.2f}"
+                f"LIVE leftover sit {event_prefix(tw['a'])} {why_ta} "
+                f"take_allin={take_allin} free={free:.2f}"
             )
-            return why_ra
+            return why_ta
         # Idle money only: never transfer to fund a second pair (T20 shard 0 etc).
     else:
         if qty <= 0:
@@ -2316,29 +2400,49 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
             try:
                 fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
             except RuntimeError as e:
-                # Shard 0 only has the $0.50 keep after MLB fills — sit, don't raise.
+                # Shard 0 only has the $0.50 keep after MLB — skip, don't raise.
                 msg = f"unfunded idx={idx} cash={cash:.2f} ({e})"
-                log(f"LIVE sit {event_prefix(tw['a'])} {msg}")
+                log(f"LIVE take {event_prefix(tw['a'])} {msg}")
                 return msg
             cash = shard_balance_dollars(k, idx)
             state["shard_balances"][str(idx)] = round(cash, 4)
-            qty = live_qty(qa, qb, cash=cash, yes_a=tw.get("yes_a"), yes_b=tw.get("yes_b"))
+            qty = live_qty(qa, qb, cash=cash, yes_a=aa, yes_b=ab, use_ask=True)
             notional = qty * unit if qty and unit else 0.0
             if qty <= 0 or cash < CLIP_NOTIONAL:
                 return f"unfunded idx={idx} cash={cash:.2f}"
+    if qty > 0 and unit > 0:
+        take_allin = _take_allin_at(qty)
+        tw = {**tw, "qty": qty, "take_allin": take_allin, "take_edge": round(1.0 - take_allin, 4)}
+        if take_allin > LIVE_TAKE_ALLIN_MAX + 1e-12:
+            return f"take_allin {take_allin}>{LIVE_TAKE_ALLIN_MAX:g}"
+
+    def _rollback_first(oid, why):
+        if not oid:
+            return why
+        if cancel_our_order(k, oid, exchange_index=idx, market_ticker=tw["a"]):
+            log(f"LIVE cancelled first buy after second side failed {tw['a']} oid={oid}")
+            return "second side failed; cancelled first"
+        # First already went through: leftover-sell path owns it. Do not buy the other side later.
+        log(f"LIVE first buy already went through {tw['a']} oid={oid}; leftover contract owns it")
+        state.setdefault("pair_placed_wall", {})[event_prefix(tw["a"])] = time.time()
+        return "first buy went through; leftover contract owns it; not buying the other side"
+
     oid_a = None
     try:
-        ra = place_yes_post_only(k, tw["a"], tw["yes_a"], qty, idx)
-        oid_a = ra.get("order_id")
-        rb = place_yes_post_only(k, tw["b"], tw["yes_b"], qty, idx)
+        ra = place_yes_ioc_buy(k, tw["a"], float(aa), qty, idx)
+        oid_a = _resp_order_id(ra)
+        rb = place_yes_ioc_buy(k, tw["b"], float(ab), qty, idx)
+        oid_b = _resp_order_id(rb)
+        if oid_a and not oid_b:
+            return _rollback_first(oid_a, "second side failed; cancelled first")
     except UnfundedShard:
-        if oid_a and not cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"]):
-            log(f"LIVE first buy still up {tw['a']} oid={oid_a} (cancel failed)")
-            return "first buy still up; cancel failed"
+        msg = _rollback_first(oid_a, "first buy still up; cancel failed")
         if leftover:
             leftover_note(state, free, qty, notional, "leftover unfunded; sit no transfer")
             log(f"SHARD miss leftover: {tw['a']} idx={idx} cash={cash:g} sit (no transfer)")
             return "leftover unfunded; sit no transfer"
+        if oid_a:
+            return msg
         log(f"SHARD miss: {tw['a']} idx={idx} cash={cash:g} → transfer ${FUND_DOLLARS:g}")
         try:
             fund_shard(k, idx, FUND_DOLLARS, ticker=tw["a"], log=log)
@@ -2346,16 +2450,16 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
             return f"unfunded-404 fund failed ({e})"
         return "unfunded-404 retried fund; skip this tick"
     except Exception:
-        if oid_a and not cancel_our_order(k, oid_a, exchange_index=idx, market_ticker=tw["a"]):
-            log(f"LIVE first buy still up {tw['a']} oid={oid_a} (cancel failed)")
+        if oid_a:
+            return _rollback_first(oid_a, "second side failed; cancelled first")
         raise
     if leftover:
         leftover_note(state, free, qty, notional)
         state["leftover_sit_reason"] = None
     state.setdefault("pair_placed_wall", {})[event_prefix(tw["a"])] = time.time()
     log(
-        f"LIVE REST {tw['a']} {qty}@{tw['yes_a']:.2f} + {tw['b']} {qty}@{tw['yes_b']:.2f} "
-        f"idx={idx} post_only=1 leftover={int(leftover)} notional={notional:.2f} "
+        f"LIVE TAKE both {tw['a']} {qty}@{float(aa):.2f} + {tw['b']} {qty}@{float(ab):.2f} "
+        f"take_allin={tw.get('take_allin')} idx={idx} leftover={int(leftover)} notional={notional:.2f} "
         f"free={free:.2f} n_live_pairs={n_rest_pairs + 1}/{n_allowed}"
     )
     return "placed"
@@ -2610,6 +2714,11 @@ def pick_watch(k: Kalshi):
                     series_rank = 2
                 else:
                     series_rank = 1
+                ya_ask = to_dollars(
+                    m.get("yes_ask_dollars") if m.get("yes_ask_dollars") is not None else m.get("yes_ask")
+                )
+                if ya_ask is None and nb is not None:
+                    ya_ask = round(1.0 - nb, 4)
                 cands.append(
                     {
                         "ticker": t,
@@ -2622,6 +2731,7 @@ def pick_watch(k: Kalshi):
                         "play_t": play_t,
                         "yb": yb,
                         "nb": nb,
+                        "ya_ask": ya_ask,
                         "in_play": in_play,
                         "two_way": two_way,
                         "vol": vol,
@@ -2629,15 +2739,10 @@ def pick_watch(k: Kalshi):
                         "exchange_index": int(ex_idx or 0),
                     }
                 )
-    # Full 2-way events (both legs). Live pairs first, then restable
-    # 2-ways (both YES in LIVE_BID_LO..HI, yb_sum<=LIVE_REST_MAX, and
-    # rest_allin<=LIVE_REST_ALLIN_MAX after M=0.5 sports fees), then
-    # series_rank (MLB/NFL/ATP/WTA before NCAAF), then volume. Do NOT prefer
-    # 50/50 over other in-band 2-ways. Band is LIVE_BID_LO..HI (35-65);
-    # 19/80 is no longer restable. Volume-only rank dropped live ATP
-    # FEAROD (52/45 rest 97c, ~2M vol) behind 100c NFL; unused series_rank let
-    # ghost NCAAF steal slots from tennis. Raw<=0.99 without fee check let
-    # DETIND/BOSNYY/PARMER hog slots while sitting rest_allin>0.99.
+    # Full 2-way events (both legs). Live pairs first, then take-both locks
+    # (both YES asks in 35-65 and take_allin<=LIVE_TAKE_ALLIN_MAX after taker
+    # fees), then series_rank (MLB/NFL/ATP/WTA before NCAAF), then volume.
+    # Do not hog slots on 99c MLB whose after-fee take is over $1.
     by_ev = {}
     for c in cands:
         by_ev.setdefault(c.get("event") or c["ticker"], []).append(c)
@@ -2654,25 +2759,35 @@ def pick_watch(k: Kalshi):
         if pair and pair[0].get("yb") is not None and pair[1].get("yb") is not None:
             ya, yb = pair[0]["yb"], pair[1]["yb"]
             yb_sum = ya + yb
-        # Align with live gate: raw yb_sum<=0.99 still marks DETIND/BOSNYY/
-        # PARMER "actionable" while rest_allin 0.996-1.008 fails LIVE_REST_ALLIN_MAX
-        # and sits forever, crowding real 97c ATP (SVRROY/BASSCH) off the watch.
+        ask_a = ask_b = None
+        take_sum = None
+        take_allin_est = None
+        if pair:
+            ask_a = pair[0].get("ya_ask")
+            ask_b = pair[1].get("ya_ask")
+            if ask_a is not None and ask_b is not None:
+                take_sum = float(ask_a) + float(ask_b)
+                qty_est = 10
+                fy = take_leg_fee(qty_est, float(ask_a), pair[0].get("ticker") or "")
+                fn = take_leg_fee(qty_est, float(ask_b), pair[1].get("ticker") or "")
+                take_allin_est = round(take_sum + (fy + fn) / qty_est, 4)
         rest_allin_est = None
         if yb_sum is not None and ya is not None and yb is not None:
             qty_est = 10
             fy = rest_leg_fee(qty_est, float(ya), pair[0].get("ticker") or "")
             fn = rest_leg_fee(qty_est, float(yb), pair[1].get("ticker") or "")
             rest_allin_est = round(yb_sum + (fy + fn) / qty_est, 4)
+        # Actionable = both asks live in 35-65 and after-fee lock under $1.
+        # Do not mark 97c bid-sum books that cost ~$1.04 to take.
+        wa, wb = (ask_a, ask_b) if (ask_a is not None and ask_b is not None) else (ya, yb)
         actionable = bool(
             pair
-            and ya is not None
-            and yb is not None
-            and LIVE_BID_LO - 1e-12 <= ya <= LIVE_BID_HI + 1e-12
-            and LIVE_BID_LO - 1e-12 <= yb <= LIVE_BID_HI + 1e-12
-            and yb_sum <= LIVE_REST_MAX + 1e-12
-            and yb_sum >= 0.90  # <0.90 is a missing outcome (3-way soccer)
-            and rest_allin_est is not None
-            and rest_allin_est <= LIVE_REST_ALLIN_MAX + 1e-12
+            and wa is not None
+            and wb is not None
+            and LIVE_BID_LO - 1e-12 <= float(wa) <= LIVE_BID_HI + 1e-12
+            and LIVE_BID_LO - 1e-12 <= float(wb) <= LIVE_BID_HI + 1e-12
+            and take_allin_est is not None
+            and take_allin_est <= LIVE_TAKE_ALLIN_MAX + 1e-12
         )
         # series_rank was computed per-leg but unused; NCAAF volume was
         # crowding ATP/MLB off the 20-slot watch (METOWS/LAFGTWN/UVAWPRE).
@@ -2693,14 +2808,14 @@ def pick_watch(k: Kalshi):
         # and rotated GULMOL 96c tennis off the 20-name watch.
         skip_unpinned = bool(
             pair
-            and ya is not None
-            and yb is not None
             and (
-                is_lopsided_pair(ya, yb)
-                or ya < LIVE_BID_LO - 1e-12
-                or ya > LIVE_BID_HI + 1e-12
-                or yb < LIVE_BID_LO - 1e-12
-                or yb > LIVE_BID_HI + 1e-12
+                wa is None
+                or wb is None
+                or is_lopsided_pair(wa, wb)
+                or float(wa) < LIVE_BID_LO - 1e-12
+                or float(wa) > LIVE_BID_HI + 1e-12
+                or float(wb) < LIVE_BID_LO - 1e-12
+                or float(wb) > LIVE_BID_HI + 1e-12
             )
         )
         scored.append(
@@ -2709,20 +2824,19 @@ def pick_watch(k: Kalshi):
                 "legs": use,
                 "yb_sum": yb_sum,
                 "rest_allin_est": rest_allin_est,
+                "take_allin_est": take_allin_est,
                 "day": day,
                 "actionable": actionable,
                 "sit_ok": sit_ok,
                 "skip_unpinned": skip_unpinned,
                 "rank": (
                     0 if pair else 1,  # 2-way GAME/MATCH before live props
-                    0 if (actionable and sit_ok) else 1,  # sit-able tight before far MLB
+                    0 if (actionable and sit_ok) else 1,  # take-both lock before far MLB
                     0 if sit_ok else 1,  # first-ball within 3h (or live) before 37h waits
                     0 if in_play else 1,
                     max(day, 0),  # today (0) before Sep NFL (3)
                     series_rank,  # MLB/NFL/ATP/WTA=0 before NCAAF=2
-                    # fee-adjusted tighter rest before volume (raw 0.99 looked
-                    # tight but sits after M=0.5 sports fees)
-                    rest_allin_est if rest_allin_est is not None else 9.0,
+                    take_allin_est if take_allin_est is not None else 9.0,
                     -vol,
                 ),
             }
@@ -2841,33 +2955,24 @@ def pick_watch(k: Kalshi):
             continue
         # Do not invent 50/50 ghosts for settled/unlisted pins.
         log(f"  skip ghost pin {t} not in universe")
-    # Tight restable 2-ways (raw <= 0.98 still pays after M=0.5; 0.99 is 1.008).
-    # Without this, aging yesterday tennis out of in_play dropped HAVHIB 95c
-    # behind today 99c MLB that we skip on rest_allin.
-    # sit_ok is required: 7:07 ET 8/30, Aug31 97c MLB (first-ball 35-38h)
-    # filled all 8 reserved slots (2c tape) while live Challenger 93-97c
-    # only squeezed in later. Sort-only sit_ok did not stop the take.
+    # Tight take-both locks (after-fee ask pair under $1). Do not reserve
+    # slots for 97c bid-sum books that cost ~$1.04 to take, or 99c MLB.
     tight = [
         row for row in scored
         if row.get("actionable")
         and row.get("sit_ok")
-        and row.get("yb_sum") is not None
-        and 0.90 <= row["yb_sum"] <= 0.9700001
-        and all(
-            (leg.get("spread") or 9) <= LIVE_SPREAD_MAX + 1e-12
-            for leg in row["legs"]
-        )
+        and row.get("take_allin_est") is not None
+        and row["take_allin_est"] <= LIVE_TAKE_ALLIN_MAX + 1e-12
         and not any(
             (leg.get("ticker") or "").upper().startswith("KXNCAAF")
             or is_cricket(leg.get("ticker") or "")
             for leg in row["legs"]
         )
     ]
-    # Same-day first so Sep-20 94c NFL does not crowd out today 98c BOSNYY.
     tight.sort(
         key=lambda x: (
             0 if int(x.get("day") if x.get("day") is not None else 9) <= 1 else 1,
-            x["yb_sum"] if x["yb_sum"] is not None else 9.0,
+            x["take_allin_est"] if x.get("take_allin_est") is not None else 9.0,
             x["rank"],
         )
     )
@@ -3092,7 +3197,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     f"take {tw['ask_a']:.2f}+{tw['ask_b']:.2f}={tw['take']:.2f} "
                     f"allin={tw['take_allin']:.3f} e={tw['take_edge']*100:+.1f}c"
                 )
-            # Fee-adjusted ask lock (take_allin<1): never auto-lift; surface loudly.
+            # Fee-adjusted ask lock under $1: both-sides take if still on the book.
             if tw.get("take_allin") is not None and float(tw["take_allin"]) < 1.0 - 1e-12:
                 lock_ts = state.setdefault("take_lock_log_ts", {})
                 lock_best = state.setdefault("take_lock_best", {})
@@ -3116,7 +3221,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     log(
                         f"TAKE LOCK {ev} asks {tw['ask_a']:.2f}+{tw['ask_b']:.2f}="
                         f"{tw['take']:.2f} allin={tw['take_allin']:.3f} "
-                        f"e={tw['take_edge']*100:+.1f}c (paper only; no auto-lift)"
+                        f"e={tw['take_edge']*100:+.1f}c (both-sides take if still on the book)"
                     )
         # Peak positive rest_edge this watch window (status was flickering n_paper=0).
         peaks = state.setdefault("edge_peaks", {})
@@ -3166,27 +3271,32 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                 mlb = a.upper().startswith("KXMLB")
                 sit_ok = sit_window_reason(t) is None
                 try:
-                    ra = float(t.get("rest_allin"))
+                    ta = float(t.get("take_allin"))
                 except (TypeError, ValueError):
-                    ra = 9.0
-                edge = t.get("rest_edge") if t.get("rest_edge") is not None else -99
+                    ta = 9.0
+                try:
+                    take_ok = ta <= LIVE_TAKE_ALLIN_MAX + 1e-12
+                except (TypeError, ValueError):
+                    take_ok = False
+                edge = t.get("take_edge") if t.get("take_edge") is not None else -99
                 if leftover_now:
-                    # Sit-window first: Aug31 MLB 97c was burning the one live
-                    # attempt/tick on "first-ball in 38h" while near Challenger
-                    # never got tried. Then independent; today MLB over tennis.
+                    # Desk window first so 37h MLB does not burn the one try.
+                    # Prefer a true after-fee lock over a 99c bid-sum book.
                     return (
                         0 if sit_ok else 1,
+                        0 if take_ok else 1,
                         0 if independent else 1,
                         0 if mlb else 1,
                         0 if not t.get("in_play") else 1,
-                        ra,
+                        ta,
                         -edge,
                     )
                 return (
                     0 if sit_ok else 1,
+                    0 if take_ok else 1,
                     0 if t.get("in_play") else 1,
                     0 if mlb else 1,
-                    ra,
+                    ta,
                     -edge,
                 )
 
@@ -3196,7 +3306,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
             sit_why = None
             attempted = False
             for tw in ranked:
-                why = live_filter_reason(tw, leftover=leftover_now)
+                why = live_filter_reason(tw, leftover=False)
                 if why:
                     evn = event_prefix(tw["a"])
                     key = f"{evn}|{why.split('(')[0][:48]}"
@@ -3207,7 +3317,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     if now - skip_log.get(key, 0) > 60:
                         skip_log[key] = now
                         tag = "leftover sit" if leftover_now else "skip"
-                        log(f"LIVE {tag} {evn} {why} rest_allin={tw.get('rest_allin')}")
+                        log(f"LIVE {tag} {evn} {why} take_allin={tw.get('take_allin')}")
                     continue
                 # Do not burn the one live attempt/tick on a 37h first-ball wait.
                 win = sit_window_reason(tw)
@@ -3221,7 +3331,7 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     if now - skip_log.get(key, 0) > 60:
                         skip_log[key] = now
                         tag = "leftover sit" if leftover_now else "skip"
-                        log(f"LIVE {tag} {evn} {win} rest_allin={tw.get('rest_allin')}")
+                        log(f"LIVE {tag} {evn} {win} take_allin={tw.get('take_allin')}")
                     continue
                 evn = event_prefix(tw["a"])
                 # Leftover only: skip a 2-way whose shard has too little free
@@ -3274,8 +3384,10 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                 state["live_busy"] = True
                 state["live_last_try"] = {
                     "event": evn,
-                    "rest_allin": tw.get("rest_allin"),
-                    "rest_edge": tw.get("rest_edge"),
+                    "take_allin": tw.get("take_allin"),
+                    "take_edge": tw.get("take_edge"),
+                    "ask_a": tw.get("ask_a"),
+                    "ask_b": tw.get("ask_b"),
                 }
                 attempted = True
 
@@ -3450,8 +3562,9 @@ async def main_async():
 
     log(
         f"ws clipper start pid={os.getpid()} live_fire={LIVE_FIRE} "
-        f"post_only=1 max_live_pairs={MAX_LIVE_PAIRS} "
-        f"pair_cash_unit={PAIR_CASH_UNIT} leftover_allin<={LIVE_REST_ALLIN_MAX}"
+        f"sit_new_pairs={SIT_NEW_PAIRS} take_both_asks=1 "
+        f"take_allin<={LIVE_TAKE_ALLIN_MAX} max_live_pairs={MAX_LIVE_PAIRS} "
+        f"pair_cash_unit={PAIR_CASH_UNIT}"
     )
     k = Kalshi()
     # Survive 90s watch refresh / seq-gap reconnects. Rebuilding state used to
