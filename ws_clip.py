@@ -57,6 +57,7 @@ from scan_lib import (  # noqa: E402
     parse_ts,
     shard_balance_dollars,
     skip_market,
+    maker_fee,
     taker_fee,
     to_dollars,
 )
@@ -1792,7 +1793,7 @@ def pick_watch(k: Kalshi):
                     continue
                 # same-day or next-day only. occurrence / expected_expiration /
                 # ticker clock. Never close_time (Kalshi close is often T+14d).
-                first_ball = occ or exp or ticker_t
+                first_ball = occ or parse_ts(m.get("expected_expiration_time")) or ticker_t
                 if first_ball is not None and (first_ball - now).total_seconds() > MAX_EVENT_HORIZON_S:
                     continue
                 if not in_play and close_t is not None and close_t <= now:
