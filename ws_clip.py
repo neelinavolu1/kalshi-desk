@@ -119,7 +119,7 @@ MAX_STACKED_PAIRS = 3  # alias: max concurrent post-only 2-way rests
 # owning only one side instead of both.
 LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
 LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
-LIVE_REST_MAX = 0.98  # both sides under 98c at the same moment
+LIVE_REST_MAX = 0.97  # skip 98c+; 97c is the last sit (Collignon/Fery 98c one-legged 8:08 ET)
 LIVE_REST_ALLIN_MAX = 0.98  # same 98c cap after sitting-buy fees
 LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93c
 # Raw take-rest gap. BROLOF 08:07 ET: 95c rest / 101c take (+3.2c all-in) one-legged in 20s.
@@ -845,7 +845,7 @@ def live_filter_reason(tw: dict, *, leftover: bool = False, placement: bool = Tr
     ):
         return "fat take-rest gap"
     ra = tw.get("rest_allin")
-    # All live rests: rest_allin <= LIVE_REST_ALLIN_MAX (0.98). Raw 0.99 is ~1.008 all-in after M=0.5.
+    # All live rests: rest_allin <= LIVE_REST_ALLIN_MAX (0.98). Raw 97c ATP can be ~0.979 after fees; raw 98c is blocked by LIVE_REST_MAX.
     if ra is None or float(ra) > LIVE_REST_ALLIN_MAX + 1e-12:
         return (
             f"idle cash but rest_allin>{LIVE_REST_ALLIN_MAX:g}"
@@ -2842,11 +2842,15 @@ def pick_watch(k: Kalshi):
     # Tight restable 2-ways (raw <= 0.98 still pays after M=0.5; 0.99 is 1.008).
     # Without this, aging yesterday tennis out of in_play dropped HAVHIB 95c
     # behind today 99c MLB that we skip on rest_allin.
+    # sit_ok is required: 7:07 ET 8/30, Aug31 97c MLB (first-ball 35-38h)
+    # filled all 8 reserved slots (2c tape) while live Challenger 93-97c
+    # only squeezed in later. Sort-only sit_ok did not stop the take.
     tight = [
         row for row in scored
         if row.get("actionable")
+        and row.get("sit_ok")
         and row.get("yb_sum") is not None
-        and 0.90 <= row["yb_sum"] <= 0.9800001
+        and 0.90 <= row["yb_sum"] <= 0.9700001
         and all(
             (leg.get("spread") or 9) <= LIVE_SPREAD_MAX + 1e-12
             for leg in row["legs"]
@@ -2859,7 +2863,6 @@ def pick_watch(k: Kalshi):
     # Same-day first so Sep-20 94c NFL does not crowd out today 98c BOSNYY.
     tight.sort(
         key=lambda x: (
-            0 if x.get("sit_ok") else 1,  # within 3h first-ball before Aug31 leftovers
             0 if int(x.get("day") if x.get("day") is not None else 9) <= 1 else 1,
             x["yb_sum"] if x["yb_sum"] is not None else 9.0,
             x["rank"],
