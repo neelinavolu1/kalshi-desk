@@ -7,13 +7,13 @@ POST /portfolio/events/orders to a shard with $0 cash returns HTTP 404
 {code: user_not_found} — unfunded/unprovisioned shard, NOT a bad key.
 GET /portfolio/balance on shard 0 can succeed while shard-3 writes fail.
 Fund first: GET /portfolio/balance?exchange_index=N, then
-POST /portfolio/intra_exchange_instance_transfer (~$12 centicents, leftover stays
+POST /portfolio/intra_exchange_instance_transfer (~$36 centicents, leftover stays
 on shard 0). V1 POST /portfolio/orders is 410; V2 /portfolio/events/orders only.
 Never lift (post_only=true). Never duplicate HARLLA. Do not cancel HARLLA.
-Concurrent post-only 2-way rests = min(2, floor(shard_cash / 9.5)), but after a
+Concurrent post-only 2-way rests = min(2, floor(shard_cash / 28.5)), but after a
 filled lock the leftover free cash on that shard may still sit a smaller second
 pair when free >= MIN_LEFTOVER_NOTIONAL (size by depth + free; do not require
-another $9.50). Do NOT wait for a filled inventory 2-way before the second rest.
+another $28.50). Do NOT wait for a filled inventory 2-way before the second rest.
 Do not spend the one live-attempt tick on a shard whose free cash is below that
 min (Sep NFL on shard 0 with $0.50) while tennis cash sits idle. Prefer
 independent events. Do not cancel a still-paying rest unless a candidate is a
@@ -99,11 +99,11 @@ HEARTBEAT = DIR / "mm_heartbeat"
 BAN_PATH = DIR / "oneleg_ban.json"
 
 LIVE_FIRE = True  # post_only 2-way YES rests only; never lift
-CAP_C = 10
-CAP_NOTIONAL = 10.0
-CLIP_NOTIONAL = 10.0  # first pair: skip live rest if dest shard cash below this; fund ~$12
-FUND_DOLLARS = 12.0
-PAIR_CASH_UNIT = 9.5  # concurrent rests = min(MAX_LIVE_PAIRS, floor(shard_cash / this))
+CAP_C = 30
+CAP_NOTIONAL = 30.0
+CLIP_NOTIONAL = 30.0  # first pair: skip live rest if dest shard cash below this; fund ~$36
+FUND_DOLLARS = 36.0
+PAIR_CASH_UNIT = 28.5  # concurrent rests = min(MAX_LIVE_PAIRS, floor(shard_cash / this))
 MAX_LIVE_PAIRS = 2  # leftover cash may rest a second pair without filled inventory
 MAX_STACKED_PAIRS = 2  # alias: max concurrent post-only 2-way rests
 # Only try a game when each team's YES buy price is between 35 cents and 65 cents.
@@ -1816,7 +1816,7 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     # Only force a first-pair slot when we have neither resting nor filled locks.
     if n_rest_pairs == 0 and n_inv_pairs == 0:
         n_allowed = max(n_allowed, 1)
-    # After a filled 2-way, total cash can fall so floor(cash/9.5) equals the
+    # After a filled 2-way, total cash can fall so floor(cash/28.5) equals the
     # remaining sitting pair (SDTB lock left $14.53 → cap 1, Svrcina/Royer
     # already sitting). ~$4.93 leftover could still buy a smaller second
     # pair on THIS shard. Count that extra slot when free cash is at least

@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 KEY_ID_PATH = Path("/home/box/.config/kalshi/key_id")
 KEY_PATH = Path("/home/box/.config/kalshi/main.key")
-CAP_C = 10
+CAP_C = 30
 M_DEFAULT = 1.0
 NEAR_MISS_WINDOW = 0.08  # report near-misses within 8c of lock after fees
 
