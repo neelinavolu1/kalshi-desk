@@ -10,7 +10,7 @@ Fund first: GET /portfolio/balance?exchange_index=N, then
 POST /portfolio/intra_exchange_instance_transfer (~$36 centicents, leftover stays
 on shard 0). V1 POST /portfolio/orders is 410; V2 /portfolio/events/orders only.
 Never lift (post_only=true). Never duplicate HARLLA. Do not cancel HARLLA.
-Concurrent post-only 2-way rests = min(2, floor(shard_cash / 28.5)), but after a
+Concurrent post-only 2-way rests = min(3, floor(shard_cash / 28.5)), but after a
 filled lock the leftover free cash on that shard may still sit a smaller second
 pair when free >= MIN_LEFTOVER_NOTIONAL (size by depth + free; do not require
 another $28.50). Do NOT wait for a filled inventory 2-way before the second rest.
@@ -104,8 +104,8 @@ CAP_NOTIONAL = 30.0
 CLIP_NOTIONAL = 30.0  # first pair: skip live rest if dest shard cash below this; fund ~$36
 FUND_DOLLARS = 36.0
 PAIR_CASH_UNIT = 28.5  # concurrent rests = min(MAX_LIVE_PAIRS, floor(shard_cash / this))
-MAX_LIVE_PAIRS = 2  # leftover cash may rest a second pair without filled inventory
-MAX_STACKED_PAIRS = 2  # alias: max concurrent post-only 2-way rests
+MAX_LIVE_PAIRS = 3  # leftover cash may sit another both-sides pair when free cash allows
+MAX_STACKED_PAIRS = 3  # alias: max concurrent post-only 2-way rests
 # Only try a game when each team's YES buy price is between 35 cents and 65 cents.
 # Outside that band one team is a heavy favorite, and we often end up
 # owning only one side instead of both.
