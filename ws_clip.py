@@ -271,9 +271,14 @@ def sit_window_reason(tw: dict, *, unknown_ok: bool = False, now=None) -> str | 
     try:
         if getattr(play_t, "tzinfo", None) is None:
             play_t = play_t.replace(tzinfo=timezone.utc)
+        local = play_t.astimezone(ET)
         delta = (play_t - now).total_seconds()
     except Exception:
         return None if unknown_ok else "no first-ball time; wait"
+    # Pal/Nam sat at 11pm for a 2am first-ball because 3h-from-now allowed it.
+    # First ball itself must land in 6am-11pm ET, not overnight.
+    if int(local.hour) < SIT_HOUR_LO or int(local.hour) > SIT_HOUR_HI:
+        return "first-ball outside 6am-11pm ET; wait"
     if delta > SIT_BEFORE_FIRST_BALL_SEC:
         return f"first-ball in {delta / 3600.0:.1f}h; wait"
     return None
