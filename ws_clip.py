@@ -2760,6 +2760,11 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                 # Leftover only: skip a 2-way whose shard has too little free
                 # cash (Bears/Vikings on shard 0 with $0.50) so this tick can
                 # try Gold/Parry on the tennis shard that still has leftover.
+                # When we are already at the pair cap, do NOT skip here: free
+                # cash is low because the sitting buys used it. We still need
+                # maybe_live_rest so upgrade can cancel the weakest sitting
+                # pair (e.g. Svrcina/Royer at 99.8c all-in) and rest a tighter
+                # 97c book (Cocciaretto/Siniakova) instead.
                 if leftover_now:
                     cache = state.get("idx_cache") or {}
                     try:
@@ -2770,7 +2775,11 @@ async def status_loop(books: dict, watch: list, stop: dict, state: dict, k: Kals
                     if free_d is None:
                         free_d = (state.get("shard_balances") or {}).get(str(dest))
                     try:
-                        if free_d is not None and float(free_d) + 1e-12 < MIN_LEFTOVER_NOTIONAL:
+                        if (
+                            free_d is not None
+                            and float(free_d) + 1e-12 < MIN_LEFTOVER_NOTIONAL
+                            and not at_cap
+                        ):
                             if sit_why is None:
                                 sit_why = (
                                     f"{evn}: dest shard free={float(free_d):.2f} "
