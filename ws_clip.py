@@ -135,10 +135,14 @@ LEFTOVER_INPLAY_BID_LO = 0.25
 LEFTOVER_INPLAY_BID_HI = 0.75
 LEFTOVER_INPLAY_BID_GAP = 0.35  # keep; applied to every 2-way live rest
 ONELEG_STALE_C = 0.02  # keep unfilled rest only if live_bid - rest_px <= 2c
-ONELEG_MAKER_WAIT_S = 45.0  # wait for 1c-under-cost maker flatten before give-up IOC
-ONELEG_GIVEUP_UNDER = 0.02  # give-up IOC only if live_bid still < target - this
-ONELEG_NEAR_C = 0.01  # existing flatten ask counts as at/near target
-ONELEG_ORPHAN_WAIT_S = 180.0  # true orphan: wait before maker-sell leftover
+ONELEG_MAKER_WAIT_S = 45.0  # wait for 1c-under-cost sitting sell
+# Pal 51→48 is ~6%. Cha 39→36 is ~8%. Never sell a leftover that far down.
+ONELEG_ALLOW_GIVEUP_IOC = False
+ONELEG_GIVEUP_UNDER = 0.02  # unused while give-up IOC is off
+MAX_LEFTOVER_LOSS_C = 0.02  # never sell more than 2¢ under what we paid
+MAX_LEFTOVER_LOSS_PCT = 0.03  # never sell more than 3% under what we paid
+ONELEG_NEAR_C = 0.01  # existing leftover sell counts as at/near target
+ONELEG_ORPHAN_WAIT_S = 180.0  # true leftover: wait before sitting sell
 # Already LIVE on book — do not duplicate, do not cancel.
 KNOWN_LIVE = (
     ("KXATPMATCH-26AUG27HARLLA-HAR", "01a044d3-b7e8-7c4c-a7fc-a328d4559e62"),
@@ -1582,6 +1586,16 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
             def _ioc_at_bid(why: str) -> str:
                 if live_bid is None or live_bid <= 0 or live_bid >= 1.0 - 1e-12 or qty <= 0:
                     return "ORCH cannot IOC-sell (no bid / no 101c)"
+                if cost is not None:
+                    floor_c = float(cost) - MAX_LEFTOVER_LOSS_C
+                    floor_p = float(cost) * (1.0 - MAX_LEFTOVER_LOSS_PCT)
+                    floor = max(floor_c, floor_p)
+                    if float(live_bid) + 1e-12 < floor:
+                        log(
+                            f"{why} {ft} refuse dump bid={live_bid:.2f} "
+                            f"cost={cost:.2f} floor={floor:.2f}"
+                        )
+                        return "refuse leftover dump (5-7% not allowed)"
                 px = round(float(live_bid), 4)
                 _cancel_asks(already_ask)
                 try:
@@ -1599,7 +1613,8 @@ def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
                 sell_note = "ORCH cannot flatten (bad cost/target / no 101c)"
             else:
                 give_up = (
-                    bool(already_ask)
+                    ONELEG_ALLOW_GIVEUP_IOC
+                    and bool(already_ask)
                     and wait_s is not None
                     and wait_s >= ONELEG_MAKER_WAIT_S
                     and live_bid is not None
