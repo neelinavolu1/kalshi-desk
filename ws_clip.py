@@ -102,7 +102,10 @@ HEARTBEAT = DIR / "mm_heartbeat"
 BAN_PATH = DIR / "oneleg_ban.json"
 FILLS_LOG = DIR / "fills.jsonl"
 
-LIVE_FIRE = True  # post_only 2-way YES rests only; never lift
+LIVE_FIRE = True  # leftover sells still live; new both-sides SITS are off
+# Sitting one team then the other is not arb. Pal/Nam and Cha/Kum one-sided.
+# Only enter later if BOTH asks add to <= 98c at the same moment (not built yet).
+SIT_NEW_PAIRS = False
 CAP_C = 30
 CAP_NOTIONAL = 30.0
 CLIP_NOTIONAL = 30.0  # first pair: skip live rest if dest shard cash below this; fund ~$36
@@ -2016,6 +2019,8 @@ def leftover_note(state: dict, cash, qty, notional, reason: str | None = None) -
 # If we already own a leftover contract on one team of this same game,
 # handle that instead -- never sit a new buy on the missing team.
 def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str:
+    if not SIT_NEW_PAIRS:
+        return "no sit; both sides must be under 98c at once"
     if event_prefix(tw["a"]) in (state.get("oneleg_ban") or set()):
         return "oneleg ban — already flattened, do not re-buy"
     cache = state.setdefault("idx_cache", {})
