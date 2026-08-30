@@ -61,6 +61,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -79,8 +80,10 @@ from scan_lib import (  # noqa: E402
     fund_shard,
     guess_exchange_index,
     is_sportsy,
+    maker_fee,
     market_exchange_index,
     parse_ts,
+    series_ticker,
     shard_balance_dollars,
     skip_market,
     taker_fee,
@@ -97,6 +100,7 @@ LOG = DIR / "mm.log"
 PIDFILE = DIR / "mm.pid"
 HEARTBEAT = DIR / "mm_heartbeat"
 BAN_PATH = DIR / "oneleg_ban.json"
+FILLS_LOG = DIR / "fills.jsonl"
 
 LIVE_FIRE = True  # post_only 2-way YES rests only; never lift
 CAP_C = 30
@@ -112,7 +116,7 @@ MAX_STACKED_PAIRS = 3  # alias: max concurrent post-only 2-way rests
 LIVE_BID_LO = 0.35  # all live 2-way rests (first pair + leftover); was 0.18
 LIVE_BID_HI = 0.65  # was 0.80; 25/70 and 63/34 one-legged
 LIVE_REST_MAX = 0.99  # raw yes+yes cap
-LIVE_REST_ALLIN_MAX = 0.99  # leftover second pair: >=~1c after M=0.5
+LIVE_REST_ALLIN_MAX = 0.99  # leftover second pair: >=~1c after sitting-buy fees
 LIVE_SPREAD_MAX = 0.03  # each leg; 7-10c books are not locks even at bid_sum~93c
 # Raw take-rest gap. BROLOF 08:07 ET: 95c rest / 101c take (+3.2c all-in) one-legged in 20s.
 LIVE_TAKE_REST_GAP_MAX = 0.04
@@ -385,13 +389,108 @@ class Book:
         }
 
 
-SPORTS_FEE_M = 0.5  # Kalshi quadratic_with_maker_fees on sports 2-ways
+SPORTS_FEE_M = 0.5  # fallback only when series fee_type is not cached yet
 GAME_KEEP = ("KXMLBGAME", "KXWNBAGAME", "KXNFLGAME", "KXT20MATCH")
+_FEE_CACHE: dict[str, dict] = {}
+_FEE_LOCK = threading.Lock()
+_ONELEG_LOCK = threading.Lock()
+_EVENT_SEEN: dict[str, set] = {}
 
 def event_prefix(ticker: str) -> str:
     if not ticker or ticker.count("-") < 2:
         return ticker
     return ticker.rsplit("-", 1)[0]
+
+
+def series_fees_lookup(k: Kalshi | None, market_ticker: str) -> tuple[str, float]:
+    """(fee_type, multiplier) from GET /series/{series}. Unknown: conservative."""
+    series = series_ticker(market_ticker)
+    if not series:
+        return "unknown", SPORTS_FEE_M
+    with _FEE_LOCK:
+        hit = _FEE_CACHE.get(series)
+    if hit:
+        return str(hit.get("fee_type") or "unknown"), float(hit.get("fee_multiplier") or 1.0)
+    if k is None:
+        return "unknown", SPORTS_FEE_M
+    try:
+        data = k.get(f"/series/{series}", signed=False) or {}
+        row = data.get("series") or data
+        ft = str(row.get("fee_type") or "quadratic")
+        raw_m = row.get("fee_multiplier")
+        m = float(raw_m) if raw_m is not None else 1.0
+        with _FEE_LOCK:
+            _FEE_CACHE[series] = {"fee_type": ft, "fee_multiplier": m}
+        return ft, m
+    except Exception:
+        return "unknown", SPORTS_FEE_M
+
+
+def rest_leg_fee(c: int, px: float, ticker: str, k: Kalshi | None = None) -> float:
+    """Fee if our sitting buy goes through (maker). Challenger tennis: $0."""
+    ft, m = series_fees_lookup(k, ticker)
+    if ft == "unknown":
+        return taker_fee(c, px, SPORTS_FEE_M)
+    if ft == "quadratic_with_maker_fees":
+        return maker_fee(c, px, m)
+    return 0.0
+
+
+def take_leg_fee(c: int, px: float, ticker: str, k: Kalshi | None = None) -> float:
+    """Fee if we pay the ask now (taker). We still never lift ~101c."""
+    ft, m = series_fees_lookup(k, ticker)
+    if ft == "unknown":
+        return taker_fee(c, px, SPORTS_FEE_M)
+    return taker_fee(c, px, m)
+
+
+def desk_event(kind: str, *, once_key: str | None = None, **fields) -> None:
+    """One JSON line per order-went-through / leftover sell / lock. Never keys."""
+    if once_key:
+        seen = _EVENT_SEEN.setdefault(kind, set())
+        if once_key in seen:
+            return
+        seen.add(once_key)
+    rec = {
+        "ts_et": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": kind,
+        **fields,
+    }
+    try:
+        with FILLS_LOG.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _pos_qty(p: dict) -> float:
+    try:
+        return abs(float(p.get("position") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def log_position_increases(prev, positions) -> None:
+    old = {}
+    for p in prev or []:
+        t = p.get("ticker")
+        if t:
+            old[t] = _pos_qty(p)
+    for p in positions or []:
+        t = p.get("ticker")
+        if not t:
+            continue
+        q = _pos_qty(p)
+        grew = q - float(old.get(t) or 0)
+        if grew > 0.5:
+            desk_event(
+                "order_went_through",
+                ticker=t,
+                event=event_prefix(t),
+                qty=round(grew, 4),
+                position=round(q, 4),
+                px=p.get("exposure"),
+            )
 
 
 def load_oneleg_ban() -> set[str]:
@@ -530,7 +629,11 @@ def reserved_dollars(orders, idx: int, cache: dict | None = None, state: dict | 
 
 
 def two_way_paper(qa: dict, qb: dict):
-    """Pair rest/take on two YES legs of a mx 2-way. Always paper-log. M=0.5."""
+    """Pair rest/take on two YES legs of a mx 2-way. Always paper-log.
+
+    Sitting-buy fee = maker (0 on Challenger, 0.0175 quadratic on tour ATP).
+    Pay-now fee = taker. We still never lift ~101c.
+    """
     ba, bb = qa.get("yes_bid"), qb.get("yes_bid")
     aa, ab = qa.get("yes_ask"), qb.get("yes_ask")
     if ba is None or bb is None or aa is None or ab is None:
@@ -544,10 +647,11 @@ def two_way_paper(qa: dict, qb: dict):
     qty = CAP_C
     rest = round(ba + bb, 4)
     take = round(aa + ab, 4)
-    fy_r = taker_fee(qty, ba, SPORTS_FEE_M)
-    fn_r = taker_fee(qty, bb, SPORTS_FEE_M)
-    fy_t = taker_fee(qty, aa, SPORTS_FEE_M)
-    fn_t = taker_fee(qty, ab, SPORTS_FEE_M)
+    ta, tb = qa.get("ticker") or "", qb.get("ticker") or ""
+    fy_r = rest_leg_fee(qty, ba, ta)
+    fn_r = rest_leg_fee(qty, bb, tb)
+    fy_t = take_leg_fee(qty, aa, ta)
+    fn_t = take_leg_fee(qty, ab, tb)
     rest_allin = round(rest + (fy_r + fn_r) / qty, 4)
     take_allin = round(take + (fy_t + fn_t) / qty, 4)
     return {
@@ -1030,6 +1134,25 @@ def _oneleg_log(state: dict, rec: dict) -> None:
         return
     ts[key] = now
     extra = f" {rec.get('flatten')}" if rec.get("flatten") else ""
+    act = str(rec.get("action") or "")
+    flatten = str(rec.get("flatten") or "")
+    kind = "oneleg"
+    if act == "ONELEG keep paired rest":
+        kind = "oneleg_keep"
+    elif "SELL" in flatten or "give-up" in act or act == "NAKED_FLATTEN":
+        kind = "leftover_sell"
+    desk_event(
+        kind,
+        once_key=f"{rec.get('event')}|{act}|{flatten}",
+        event=rec.get("event"),
+        ticker=rec.get("filled"),
+        qty=rec.get("filled_qty"),
+        px=rec.get("filled_px"),
+        action=act,
+        note=flatten or None,
+        rest=rec.get("rest"),
+        rest_px=rec.get("rest_px"),
+    )
     log(
         f"ONELEG {rec.get('event')} filled={rec.get('filled')} "
         f"{rec.get('filled_qty')}@{rec.get('filled_px')} "
@@ -1046,6 +1169,11 @@ def _oneleg_log(state: dict, rec: dict) -> None:
 # Other buy gone: wait 3 minutes after the first order went through, then
 # sell the leftover contract. Never pay $1.01+ to complete the pair.
 def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
+    with _ONELEG_LOCK:
+        return _handle_oneleg_inventory_unlocked(k, state, books)
+
+
+def _handle_oneleg_inventory_unlocked(k: Kalshi, state: dict, books=None):
     positions = state.get("open_positions") or []
     orders = state.get("resting") or []
     by_ev: dict[str, list] = {}
@@ -1078,6 +1206,13 @@ def handle_oneleg_inventory(k: Kalshi, state: dict, books=None):
                 pass
         if len(plist) == 2 and len(sizes) == 2 and abs(sizes[0] - sizes[1]) <= 1e-6:
             (state.get("oneleg_seen_ts") or {}).pop(ev, None)
+            desk_event(
+                "lock_complete",
+                once_key=ev,
+                event=ev,
+                qty=sizes[0],
+                tickers=[p.get("ticker") for p in plist],
+            )
             continue
         # Flatten-price path only when exactly one leg has inventory.
         if len(plist) != 1:
@@ -1456,6 +1591,7 @@ def refresh_portfolio(k: Kalshi, watch: list, state: dict, books=None) -> None:
         else:
             cache[t] = market_exchange_index(k, t, cache)
         idxs.add(int(cache[t]))
+        series_fees_lookup(k, t)
     bals = {}
     for i in sorted(idxs):
         bals[str(i)] = round(shard_balance_dollars(k, i), 4)
@@ -1487,7 +1623,9 @@ def refresh_portfolio(k: Kalshi, watch: list, state: dict, books=None) -> None:
         n_allowed = max(n_allowed, 1)
     state["pair_cap"] = n_allowed
     state["resting_failed_shards"] = failed
+    prev_pos = list(state.get("open_positions") or [])
     positions, pos_failed = collect_open_positions(k, sorted(idxs))
+    log_position_increases(prev_pos, positions)
     state["open_positions"] = positions
     state["n_open_pos"] = len(positions)
     state["open_pos_tickers"] = sorted({p["ticker"] for p in positions if p.get("ticker")})
@@ -1533,8 +1671,8 @@ def resting_pair_quote(orders, ev: str) -> dict | None:
     ya, yb = float(by_t[a]), float(by_t[b])
     qty = max(1, int(min(qty_by_t[a], qty_by_t[b])))
     rest = round(ya + yb, 4)
-    fy = taker_fee(qty, ya, SPORTS_FEE_M)
-    fn = taker_fee(qty, yb, SPORTS_FEE_M)
+    fy = rest_leg_fee(qty, ya, a)
+    fn = rest_leg_fee(qty, yb, b)
     rest_allin = round(rest + (fy + fn) / qty, 4)
     return {
         "a": a,
@@ -1759,7 +1897,9 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
     state["n_resting"] = len(orders)
     if int(idx) in failed or 3 in failed:
         return f"resting GET miss failed={failed}; not placing"
+    prev_pos = list(state.get("open_positions") or [])
     positions, pos_failed = collect_open_positions(k, sorted({0, 3, int(idx)}))
+    log_position_increases(prev_pos, positions)
     state["open_positions"] = positions
     state["n_open_pos"] = len(positions)
     state["open_pos_tickers"] = sorted({p["ticker"] for p in positions if p.get("ticker")})
@@ -1887,8 +2027,8 @@ def maybe_live_rest(k: Kalshi, tw: dict, qa: dict, qb: dict, state: dict) -> str
             )
             return msg
         # Recompute all-in at the actual leftover size (small qty can worsen unit fee).
-        fy = taker_fee(qty, float(tw["yes_a"]), SPORTS_FEE_M)
-        fn = taker_fee(qty, float(tw["yes_b"]), SPORTS_FEE_M)
+        fy = rest_leg_fee(qty, float(tw["yes_a"]), tw["a"])
+        fn = rest_leg_fee(qty, float(tw["yes_b"]), tw["b"])
         rest_allin = round(unit + (fy + fn) / qty, 4)
         tw = {**tw, "qty": qty, "rest_allin": rest_allin, "rest_edge": round(1.0 - rest_allin, 4)}
         if rest_allin > LIVE_REST_ALLIN_MAX + 1e-12:
@@ -2245,8 +2385,8 @@ def pick_watch(k: Kalshi):
         rest_allin_est = None
         if yb_sum is not None and ya is not None and yb is not None:
             qty_est = 10
-            fy = taker_fee(qty_est, float(ya), SPORTS_FEE_M)
-            fn = taker_fee(qty_est, float(yb), SPORTS_FEE_M)
+            fy = rest_leg_fee(qty_est, float(ya), pair[0].get("ticker") or "")
+            fn = rest_leg_fee(qty_est, float(yb), pair[1].get("ticker") or "")
             rest_allin_est = round(yb_sum + (fy + fn) / qty_est, 4)
         actionable = bool(
             pair

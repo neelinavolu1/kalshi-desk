@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -59,6 +60,24 @@ def taker_fee(c: int, p: float, m: float = M_DEFAULT) -> float:
     return ceil_cent(m * 0.07 * c * p * (1.0 - p))
 
 
+def maker_fee(c: int, p: float, m: float = M_DEFAULT) -> float:
+    """Official maker fee on fee_type=quadratic_with_maker_fees (July 2026+).
+
+    round_up(M * 0.0175 * C * P * (1-P)) to the next cent.
+    Sitting buys on fee_type=quadratic pay 0 — do not call this for those.
+    Not the old flat $0.0025/contract (pre-July 2026).
+    """
+    if c <= 0 or p <= 0 or p >= 1:
+        return 0.0
+    return ceil_cent(m * 0.0175 * c * p * (1.0 - p))
+
+
+def series_ticker(market_ticker: str) -> str:
+    """KXATPCHALLENGERMATCH-26AUG30GULMOL-GUL -> KXATPCHALLENGERMATCH."""
+    t = (market_ticker or "").strip()
+    return t.split("-", 1)[0] if t else ""
+
+
 def load_auth():
     key_id = KEY_ID_PATH.read_text().strip()
     pem = KEY_PATH.read_bytes()
@@ -85,6 +104,7 @@ class Kalshi:
         })
         self.last = 0.0
         self.min_interval = 0.12
+        self._rate_lock = threading.Lock()
         self.n_req = 0
         self.n_429 = 0
 
@@ -128,6 +148,14 @@ class Kalshi:
             raise UnfundedShard(f"HTTP 404 user_not_found on {path} (unfunded/unprovisioned shard, not a bad key)")
         raise RuntimeError(f"HTTP {r.status_code} on {path}: {self._safe_body(r)}")
 
+    def _pace(self):
+        """Thread-safe min-interval between REST calls."""
+        with self._rate_lock:
+            elapsed = time.monotonic() - self.last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last = time.monotonic()
+
     def get(self, path: str, params=None, signed=True, retries=6):
         # path like /portfolio/balance  (we prepend /trade-api/v2 for signing)
         api_path = "/trade-api/v2" + path
@@ -135,9 +163,7 @@ class Kalshi:
         backoff = 1.5
         last_err = None
         for attempt in range(retries):
-            elapsed = time.monotonic() - self.last
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
+            self._pace()
             headers = self._sign("GET", api_path) if signed else {}
             self.n_req += 1
             try:
@@ -175,9 +201,7 @@ class Kalshi:
         backoff = 1.5
         last_err = None
         for attempt in range(retries):
-            elapsed = time.monotonic() - self.last
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
+            self._pace()
             headers = self._sign("POST", api_path)
             headers["Content-Type"] = "application/json"
             self.n_req += 1
@@ -226,9 +250,7 @@ class Kalshi:
         backoff = 1.5
         last_err = None
         for attempt in range(retries):
-            elapsed = time.monotonic() - self.last
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
+            self._pace()
             headers = self._sign("DELETE", api_path)
             self.n_req += 1
             try:
